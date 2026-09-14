@@ -1,0 +1,2 @@
+# Inventory-sales
+KJ STORE INVENTORY AND SALES
