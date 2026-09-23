@@ -20,7 +20,16 @@ const UNITS = [
   { value: 'kg', label: 'Kilogram (kg)', shortLabel: 'kg', shortLabelPlural: 'kg', fractional: true },
   { value: 'g', label: 'Gram (g)', shortLabel: 'g', shortLabelPlural: 'g', fractional: true },
   { value: 'liter', label: 'Liter (L)', shortLabel: 'L', shortLabelPlural: 'L', fractional: true },
-  { value: 'ml', label: 'Milliliter (mL)', shortLabel: 'mL', shortLabelPlural: 'mL', fractional: true }
+  { value: 'ml', label: 'Milliliter (mL)', shortLabel: 'mL', shortLabelPlural: 'mL', fractional: true },
+  { value: 'm', label: 'Meter (m)', shortLabel: 'm', shortLabelPlural: 'm', fractional: true },
+  { value: 'cm', label: 'Centimeter (cm)', shortLabel: 'cm', shortLabelPlural: 'cm', fractional: true },
+  // Bulk aggregate (sand, gravel, soil, crushed stone, ...) sold by the
+  // dump-truck load. Quantity is fractional so "1/2 Load" is just 0.5, and
+  // "2 Half Loads" is 1 -- same load count, no separate half/quarter units
+  // needed. step is coarser than the other fractional units (quarter-load
+  // increments instead of thousandths) since that's how loads are actually
+  // ordered and priced.
+  { value: 'load', label: 'Load (dump truck)', shortLabel: 'load', shortLabelPlural: 'loads', fractional: true, step: 0.25 }
 ];
 const UNIT_MAP = new Map(UNITS.map((unit) => [unit.value, unit]));
 const DEFAULT_UNIT = 'piece';
@@ -38,7 +47,17 @@ function clone(value) {
 }
 
 function emptyDatabase() {
-  return { version: 2, users: [], products: [], sales: [], session: null };
+  return { version: 2, users: [], products: [], sales: [], session: null, settings: { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }, auditLog: [] };
+}
+
+// Keeps a rolling history of sensitive actions (price/cost changes, manual
+// stock adjustments, sales, voids, user/role changes) so a Super Admin can
+// review who did what. Capped so the data file doesn't grow forever.
+const AUDIT_LOG_LIMIT = 2000;
+function pushAuditEntry(data, entry) {
+  if (!Array.isArray(data.auditLog)) data.auditLog = [];
+  data.auditLog.push({ id: randomUUID(), at: new Date().toISOString(), ...entry });
+  if (data.auditLog.length > AUDIT_LOG_LIMIT) data.auditLog = data.auditLog.slice(data.auditLog.length - AUDIT_LOG_LIMIT);
 }
 
 function passwordHash(password) {
@@ -234,7 +253,9 @@ function createStore(databasePath) {
     return { archivedCount: toArchive.length, years: [...byYear.keys()].sort((a, b) => a - b), remaining: data.sales.length };
   }
 
-  function migrate(data) {
+  const RECEIPT_PAPER_WIDTHS = ['58mm', '80mm'];
+
+function migrate(data) {
     let changed = false;
     if (!Array.isArray(data.users)) { data.users = []; changed = true; }
     if (data.users.length === 0) { data.users.push(defaultSuperAdmin()); changed = true; }
@@ -245,6 +266,13 @@ function createStore(databasePath) {
         if (typeof product.costPrice !== 'number') { product.costPrice = 0; changed = true; }
       }
     }
+    if (!data.settings || typeof data.settings !== 'object') { data.settings = { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }; changed = true; }
+    else {
+      if (!RECEIPT_PAPER_WIDTHS.includes(data.settings.receiptPaperWidth)) { data.settings.receiptPaperWidth = '80mm'; changed = true; }
+      const cap = data.settings.maxRegularUserDiscountPercent;
+      if (typeof cap !== 'number' || !Number.isFinite(cap) || cap < 0 || cap > 100) { data.settings.maxRegularUserDiscountPercent = 20; changed = true; }
+    }
+    if (!Array.isArray(data.auditLog)) { data.auditLog = []; changed = true; }
     if (data.version !== 2) { data.version = 2; changed = true; }
     return changed;
   }
@@ -307,18 +335,19 @@ function createStore(databasePath) {
     return read().users.map(publicUser).sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  function createUser(input) {
+  function createUser(input, actorUserId) {
     const data = read();
     const user = cleanUser(input);
     if (data.users.some((candidate) => candidate.username === user.username)) throw new StoreError('That username or email is already in use.');
     const now = new Date().toISOString();
     const saved = { id: randomUUID(), name: user.name, username: user.username, passwordHash: passwordHash(user.password), role: user.role, active: user.active, createdAt: now, updatedAt: now, lastLoginAt: null };
     data.users.push(saved);
+    pushAuditEntry(data, { userId: actorUserId || null, action: 'User created', target: `${saved.name} (${saved.username})`, field: 'role', before: null, after: saved.role });
     write(data);
     return publicUser(saved);
   }
 
-  function updateUser(id, input) {
+  function updateUser(id, input, actorUserId) {
     const data = read();
     const existing = data.users.find((user) => user.id === id);
     if (!existing) throw new StoreError('This user no longer exists.');
@@ -326,8 +355,13 @@ function createStore(databasePath) {
     if (data.users.some((candidate) => candidate.id !== id && candidate.username === changes.username)) throw new StoreError('That username or email is already in use.');
     const wouldRemoveLastAdmin = existing.role === 'super-admin' && existing.active && (!changes.active || changes.role !== 'super-admin') && activeSuperAdminCount(data, id) === 0;
     if (wouldRemoveLastAdmin) throw new StoreError('Keep at least one active Super Admin account.');
+    const before = { role: existing.role, active: existing.active, name: existing.name, username: existing.username };
     Object.assign(existing, { name: changes.name, username: changes.username, role: changes.role, active: changes.active, updatedAt: new Date().toISOString() });
     if (changes.password) existing.passwordHash = passwordHash(changes.password);
+    const target = `${existing.name} (${existing.username})`;
+    if (before.role !== existing.role) pushAuditEntry(data, { userId: actorUserId || null, action: 'User role changed', target, field: 'role', before: before.role, after: existing.role });
+    if (before.active !== existing.active) pushAuditEntry(data, { userId: actorUserId || null, action: 'User account modified', target, field: 'active', before: before.active, after: existing.active });
+    if (before.name !== existing.name || before.username !== existing.username) pushAuditEntry(data, { userId: actorUserId || null, action: 'User account modified', target, field: 'profile', before: `${before.name} / ${before.username}`, after: `${existing.name} / ${existing.username}` });
     write(data);
     return publicUser(existing);
   }
@@ -387,7 +421,7 @@ function createStore(databasePath) {
     return clone(saved);
   }
 
-  function updateProduct(id, input) {
+  function updateProduct(id, input, actorUserId) {
     const data = read();
     const product = data.products.find((item) => item.id === id);
     if (!product) throw new StoreError('This product no longer exists.');
@@ -395,25 +429,41 @@ function createStore(databasePath) {
     if (changes.sku && data.products.some((item) => item.id !== id && item.sku.toLowerCase() === changes.sku.toLowerCase())) {
       throw new StoreError('That SKU is already being used by another product.');
     }
+    const before = { price: product.price, costPrice: product.costPrice, stock: product.stock };
     Object.assign(product, changes, { updatedAt: new Date().toISOString() });
+    // One audit row per changed field that actually matters for fraud
+    // detection, so "edited SKU casing" doesn't drown out "changed the price".
+    const auditableFields = [
+      ['price', 'Selling price changed'],
+      ['costPrice', 'Cost price changed'],
+      ['stock', 'Inventory manually adjusted']
+    ];
+    for (const [field, action] of auditableFields) {
+      if (before[field] !== product[field]) {
+        pushAuditEntry(data, { userId: actorUserId || null, action, target: `${product.name} (${product.sku || product.id})`, field, before: before[field], after: product[field] });
+      }
+    }
     write(data);
     return clone(product);
   }
 
-  function archiveProduct(id) {
+  function archiveProduct(id, actorUserId) {
     const data = read();
     const product = data.products.find((item) => item.id === id);
     if (!product) throw new StoreError('This product no longer exists.');
     product.archived = true;
     product.updatedAt = new Date().toISOString();
+    pushAuditEntry(data, { userId: actorUserId || null, action: 'Product archived', target: `${product.name} (${product.sku || product.id})`, field: 'archived', before: false, after: true });
     write(data);
   }
 
-  function completeSale(rawItems, userId) {
+  function completeSale(rawItems, userId, rawDiscount = 0) {
     if (!Array.isArray(rawItems) || rawItems.length === 0) throw new StoreError('Add at least one product before completing the sale.');
     const data = read();
     const user = data.users.find((candidate) => candidate.id === userId && candidate.active);
     if (!user) throw new StoreError('Your session is no longer active. Please sign in again.');
+    const discount = Number(rawDiscount) || 0;
+    if (!Number.isFinite(discount) || discount < 0) throw new StoreError('Discount must be zero or greater.');
     const quantities = new Map();
     for (const item of rawItems) {
       const quantity = Number(item.quantity);
@@ -442,19 +492,37 @@ function createStore(databasePath) {
         sku: product.sku,
         unit: product.unit,
         unitPrice: product.price,
+        // Snapshotted like unitPrice, so a later edit to the product's cost
+        // price never rewrites the profit on a sale that already happened.
+        costPrice: product.costPrice || 0,
         quantity,
         subtotal: Number((product.price * quantity).toFixed(2))
       });
     }
 
     const now = new Date().toISOString();
+    const subtotal = Number(items.reduce((total, item) => total + item.subtotal, 0).toFixed(2));
+    if (discount > subtotal) throw new StoreError('Discount cannot be greater than the subtotal.');
+    // Regular Users can discount up to a configurable cap (Settings, Super
+    // Admin only); Super Admins are unlimited. The role comes from the
+    // server-resolved `user` above, never from anything the renderer sent.
+    if (user.role !== 'super-admin' && discount > 0) {
+      const configuredCap = Number(data.settings?.maxRegularUserDiscountPercent);
+      const capPercent = Number.isFinite(configuredCap) ? Math.max(0, Math.min(100, configuredCap)) : 20;
+      const maxAllowedDiscount = Number((subtotal * (capPercent / 100)).toFixed(2));
+      if (discount > maxAllowedDiscount) {
+        throw new StoreError(`Discount cannot exceed ${capPercent}% of the subtotal (\u20b1${maxAllowedDiscount.toFixed(2)}) for your account. Ask a Super Admin for a larger discount.`);
+      }
+    }
     const sale = {
       id: `KJ-${Date.now().toString(36).toUpperCase()}-${randomUUID().slice(0, 5).toUpperCase()}`,
       createdAt: now,
       status: 'Completed',
       userId: user.id,
       itemCount: items.reduce((total, item) => total + item.quantity, 0),
-      total: Number(items.reduce((total, item) => total + item.subtotal, 0).toFixed(2)),
+      subtotal,
+      discount: Number(discount.toFixed(2)),
+      total: Number((subtotal - discount).toFixed(2)),
       items
     };
 
@@ -465,6 +533,8 @@ function createStore(databasePath) {
       product.updatedAt = now;
     }
     data.sales.unshift(sale);
+    if (sale.discount > 0) pushAuditEntry(data, { userId: user.id, action: 'Discount applied', target: sale.id, field: 'discount', before: 0, after: sale.discount });
+    pushAuditEntry(data, { userId: user.id, action: 'Sale completed', target: sale.id, field: 'total', before: null, after: sale.total });
     write(data);
     return clone(sale);
   }
@@ -541,7 +611,7 @@ function createStore(databasePath) {
     if (type === 'custom' && (!filter.start || !filter.end)) {
       return {
         filter: { type, start: null, end: null, unit: 'day', userId: filter.userId || null },
-        summary: { totalSales: 0, transactionCount: 0, productsSold: 0, averageSale: 0 },
+        summary: { totalSales: 0, transactionCount: 0, productsSold: 0, averageSale: 0, totalProfit: 0, profitMargin: 0 },
         insights: { best: null, lowest: null },
         graph: []
       };
@@ -580,18 +650,30 @@ function createStore(databasePath) {
       if (unit === 'year') bucketEnd.setFullYear(bucketEnd.getFullYear() + 1);
       const label = unit === 'day' ? bucketStartDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : unit === 'week' ? `Week of ${bucketStartDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}` : unit === 'month' ? bucketStartDate.toLocaleDateString('en-US', { month: 'short' }) : String(bucketStartDate.getFullYear());
       const tooltip = unit === 'week' ? `${bucketStartDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} to ${new Date(bucketEnd.getTime() - 1).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}` : unit === 'day' ? bucketStartDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : unit === 'month' ? bucketStartDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : String(bucketStartDate.getFullYear());
-      graph.push({ label, tooltip, start: bucketStartDate.getTime(), end: bucketEnd.getTime(), total: 0, transactions: 0, itemsSold: 0 });
+      graph.push({ label, tooltip, start: bucketStartDate.getTime(), end: bucketEnd.getTime(), total: 0, transactions: 0, itemsSold: 0, profit: 0 });
       bucketStartDate = bucketEnd;
     }
+
+    // Older sales (recorded before cost price existed, or an item whose product
+    // was deleted from an even older export) may not carry their own costPrice
+    // snapshot. Fall back to the product's current cost price so profit still
+    // shows a reasonable estimate instead of silently under/over-counting it as
+    // pure profit.
+    const currentCostById = new Map(data.products.map((product) => [product.id, product.costPrice || 0]));
+    const saleProfit = (sale) => {
+      const cost = sale.items.reduce((total, item) => total + (item.quantity * (typeof item.costPrice === 'number' ? item.costPrice : (currentCostById.get(item.productId) || 0))), 0);
+      return Number((sale.total - cost).toFixed(2));
+    };
 
     const userId = filter.userId || null;
     const completedSales = collectSales(data, { start, end }).filter((sale) => sale.status === 'Completed' && (!userId || sale.userId === userId) && new Date(sale.createdAt).getTime() >= start.getTime() && new Date(sale.createdAt).getTime() < end.getTime());
     for (const sale of completedSales) {
       const time = new Date(sale.createdAt).getTime();
       const bucket = graph.find((entry) => time >= entry.start && time < entry.end);
-      if (bucket) { bucket.total += sale.total; bucket.transactions += 1; bucket.itemsSold += sale.itemCount; }
+      if (bucket) { bucket.total += sale.total; bucket.transactions += 1; bucket.itemsSold += sale.itemCount; bucket.profit += saleProfit(sale); }
     }
     const totalSales = Number(completedSales.reduce((total, sale) => total + sale.total, 0).toFixed(2));
+    const totalProfit = Number(completedSales.reduce((total, sale) => total + saleProfit(sale), 0).toFixed(2));
     const transactionCount = completedSales.length;
     const productsSold = completedSales.reduce((total, sale) => total + sale.itemCount, 0);
     const periodsWithSales = graph.filter((period) => period.transactions > 0);
@@ -599,9 +681,16 @@ function createStore(databasePath) {
 
     return {
       filter: { type, start: start.toISOString(), end: end.toISOString(), unit, userId },
-      summary: { totalSales, transactionCount, productsSold, averageSale: transactionCount ? Number((totalSales / transactionCount).toFixed(2)) : 0 },
+      summary: {
+        totalSales,
+        transactionCount,
+        productsSold,
+        averageSale: transactionCount ? Number((totalSales / transactionCount).toFixed(2)) : 0,
+        totalProfit,
+        profitMargin: totalSales ? Number(((totalProfit / totalSales) * 100).toFixed(1)) : 0
+      },
       insights: { best: serializePeriod(periodsWithSales.reduce((best, period) => !best || period.total > best.total ? period : best, null)), lowest: serializePeriod(periodsWithSales.reduce((lowest, period) => !lowest || period.total < lowest.total ? period : lowest, null)) },
-      graph: graph.map(({ label, tooltip, total, transactions, itemsSold }) => ({ label, tooltip, total: Number(total.toFixed(2)), transactions, itemsSold }))
+      graph: graph.map(({ label, tooltip, total, transactions, itemsSold, profit }) => ({ label, tooltip, total: Number(total.toFixed(2)), transactions, itemsSold, profit: Number(profit.toFixed(2)) }))
     };
   }
 
@@ -903,6 +992,7 @@ function createStore(databasePath) {
     sale.voidedAt = now;
     sale.voidedBy = userId;
     sale.voidReason = cleanReason;
+    pushAuditEntry(data, { userId, action: 'Sale voided', target: sale.id, field: 'status', before: 'Completed', after: 'Voided', note: cleanReason });
 
     if (archiveYear !== null) {
       // The stock restoration above still needs to land in the hot file
@@ -915,9 +1005,37 @@ function createStore(databasePath) {
     return clone(sale);
   }
 
+  function getSettings() {
+    const data = read();
+    return clone(data.settings || { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 });
+  }
+
+  function updateSettings(input = {}) {
+    const data = read();
+    if (!data.settings || typeof data.settings !== 'object') data.settings = { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 };
+    if (input.receiptPaperWidth !== undefined) {
+      if (!RECEIPT_PAPER_WIDTHS.includes(input.receiptPaperWidth)) throw new StoreError('Paper width must be 58mm or 80mm.');
+      data.settings.receiptPaperWidth = input.receiptPaperWidth;
+    }
+    if (input.maxRegularUserDiscountPercent !== undefined) {
+      const cap = Number(input.maxRegularUserDiscountPercent);
+      if (!Number.isFinite(cap) || cap < 0 || cap > 100) throw new StoreError('Discount limit must be a percentage between 0 and 100.');
+      data.settings.maxRegularUserDiscountPercent = Number(cap.toFixed(2));
+    }
+    write(data);
+    return clone(data.settings);
+  }
+
+  function listAuditLog({ limit = 300 } = {}) {
+    const data = read();
+    const log = Array.isArray(data.auditLog) ? data.auditLog : [];
+    return clone(log.slice(-limit).reverse());
+  }
+
   return {
     CATEGORIES,
     UNITS,
+    RECEIPT_PAPER_WIDTHS,
     initialize,
     getData,
     seedDemoData,
@@ -942,7 +1060,10 @@ function createStore(databasePath) {
     listUsers,
     getUser,
     createUser,
-    updateUser
+    updateUser,
+    getSettings,
+    updateSettings,
+    listAuditLog
   };
 }
 

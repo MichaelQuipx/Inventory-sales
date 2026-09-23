@@ -55,6 +55,8 @@ const SALE_COLUMNS = [
   { label: 'Date', value: (sale) => sale.createdAt },
   { label: 'Processed By', value: (sale) => userDisplayName(sale.userId) },
   { label: 'Items', value: (sale) => sale.itemCount },
+  { label: 'Subtotal', value: (sale) => sale.subtotal ?? sale.total },
+  { label: 'Discount', value: (sale) => sale.discount ?? 0 },
   { label: 'Total', value: (sale) => sale.total },
   { label: 'Status', value: (sale) => sale.status }
 ];
@@ -125,17 +127,15 @@ function buildInventoryReportSections(report, includeCost) {
     { title: 'By Category', columns: categoryColumns, rows: report.byCategory }
   ];
 }
-// Regular users can view/export the inventory report, but cost-price-derived
-// figures (margin-sensitive) are stripped for anyone who isn't a Super Admin.
-function stripInventoryReportCost(report, role) {
-  if (role === 'super-admin') return report;
-  const { inventoryValueAtCost, ...summary } = report.summary;
-  return {
-    summary,
-    byCategory: report.byCategory.map(({ valueAtCost, ...rest }) => rest),
-    lowStock: report.lowStock.map(({ costPrice, ...rest }) => rest),
-    outOfStock: report.outOfStock.map(({ costPrice, ...rest }) => rest)
-  };
+// Inventory (including cost price) is now full access for all users, so no
+// role-based stripping is needed here (unlike the Dashboard's profit
+// figures, which stay Super-Admin-only since Dashboard itself is restricted).
+// Profit is derived from cost price, so it's stripped from the dashboard for
+// anyone who isn't a Super Admin -- same rule as the inventory report/exports.
+function stripDashboardProfit(dashboard, role) {
+  if (role === 'super-admin') return dashboard;
+  const { totalProfit, profitMargin, ...summary } = dashboard.summary;
+  return { ...dashboard, summary, graph: dashboard.graph.map(({ profit, ...rest }) => rest) };
 }
 function datedFilename(base) { return `${base}_${new Date().toISOString().slice(0, 10)}.csv`; }
 async function exportCsv(defaultFileName, csvContent) {
@@ -143,6 +143,17 @@ async function exportCsv(defaultFileName, csvContent) {
   if (result.canceled || !result.filePath) return { saved: false };
   fs.writeFileSync(result.filePath, csvContent, 'utf8');
   return { saved: true, path: result.filePath };
+}
+
+// Returns the exact same HTML that would be sent to the printer, so the
+// in-app preview is a true WYSIWYG of the printed receipt -- one receipt
+// template, never two implementations to keep in sync.
+function buildReceiptPreview(saleId, paperWidth) {
+  if (!saleId || typeof saleId !== 'string') throw new StoreError('A valid sale is required to preview a receipt.');
+  const sale = store.getSale(saleId);
+  if (!sale) throw new StoreError('That transaction could not be found.');
+  const width = store.RECEIPT_PAPER_WIDTHS.includes(paperWidth) ? paperWidth : store.getSettings().receiptPaperWidth;
+  return buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId) });
 }
 
 // Electron flow: sale ID -> look up sale/items -> build receipt HTML -> load
@@ -153,11 +164,12 @@ async function printSaleReceipt(saleId, paperWidth) {
   if (printInProgress) throw new StoreError('A receipt is already printing. Please wait for it to finish.');
   const sale = store.getSale(saleId);
   if (!sale) throw new StoreError('That transaction could not be found.');
+  const width = store.RECEIPT_PAPER_WIDTHS.includes(paperWidth) ? paperWidth : store.getSettings().receiptPaperWidth;
 
   printInProgress = true;
   let printWindow;
   try {
-    const html = buildReceiptHtml(sale, { paperWidth, processedByName: userDisplayName(sale.userId) });
+    const html = buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId) });
     printWindow = new BrowserWindow({
       show: false,
       parent: mainWindow,
@@ -195,30 +207,49 @@ function registerStoreHandlers() {
   handle('store:data', () => { requireAuth(); return store.getData(); });
   handle('store:categories', () => { requireAuth(); return store.CATEGORIES; });
   handle('store:units', () => { requireAuth(); return store.UNITS; });
+  // Regular Users can add/edit/archive products directly (price, stock,
+  // etc. -- see the client's latest decision). Cost price stays hidden from
+  // them in the UI/exports, and every change is still recorded in the audit
+  // log with who made it, so this isn't a blind-trust rollback.
   handle('product:create', (product) => { requireAuth(); return store.createProduct(product); });
-  handle('product:update', (id, product) => { requireAuth(); return store.updateProduct(id, product); });
-  handle('product:archive', (id) => { requireAuth(); return store.archiveProduct(id); });
+  handle('product:update', (id, product) => { const user = requireAuth(); return store.updateProduct(id, product, user.id); });
+  handle('product:archive', (id) => { const user = requireAuth(); return store.archiveProduct(id, user.id); });
   // The processing user always comes from the authenticated session, never from
   // renderer-supplied input, so a sale can't be attributed to someone else.
-  handle('sale:complete', (items) => { const user = requireAuth(); return store.completeSale(items, user.id); });
+  handle('sale:complete', (items, discount) => { const user = requireAuth(); return store.completeSale(items, user.id, discount); });
   handle('sale:list', (filters) => { requireAuth(); return store.listSales(filters); });
   handle('sale:get', (id) => { requireAuth(); return store.getSale(id); });
   handle('sale:print-receipt', (saleId, paperWidth) => { requireAuth(); return printSaleReceipt(saleId, paperWidth); });
+  handle('sale:receipt-preview', (saleId, paperWidth) => { requireAuth(); return buildReceiptPreview(saleId, paperWidth); });
   handle('sale:void', (saleId, reason) => { const user = requireRole('super-admin'); return store.voidSale(saleId, user.id, reason); });
   handle('archive:summary', () => { requireRole('super-admin'); return store.archiveSummary(); });
   handle('archive:run', (cutoffDate) => { requireRole('super-admin'); return store.archiveSalesBefore(cutoffDate); });
-  handle('dashboard:get', (period) => { requireAuth(); return store.dashboard(period); });
+  handle('dashboard:get', (period) => { const user = requireRole('super-admin'); return stripDashboardProfit(store.dashboard(period), user.role); });
+  handle('settings:get', () => { requireAuth(); return store.getSettings(); });
+  // receiptPaperWidth is a harmless per-install preference, open to any
+  // signed-in user. Anything else in settings (e.g. the discount cap) is
+  // security-relevant, so it's locked to Super Admin -- otherwise a Regular
+  // User could simply raise their own discount ceiling.
+  handle('settings:update', (input) => {
+    const user = requireAuth();
+    const sensitiveKeys = Object.keys(input || {}).filter((key) => key !== 'receiptPaperWidth');
+    if (sensitiveKeys.length && user.role !== 'super-admin') throw new StoreError('You do not have permission to change that setting.');
+    return store.updateSettings(input);
+  });
+  handle('audit:list', (filters) => { requireRole('super-admin'); return store.listAuditLog(filters); });
 
   // Minimal, non-privileged lookup so any signed-in user can resolve "Processed
   // By" names in History without exposing email, role, or status to non-admins.
   handle('user:names', () => { requireAuth(); return store.listUsers().map(({ id, name }) => ({ id, name })); });
 
   handle('user:list', () => { requireRole('super-admin'); return store.listUsers(); });
-  handle('user:create', (user) => { requireRole('super-admin'); return store.createUser(user); });
-  handle('user:update', (id, user) => { requireRole('super-admin'); return store.updateUser(id, user); });
+  handle('user:create', (user) => { const admin = requireRole('super-admin'); return store.createUser(user, admin.id); });
+  handle('user:update', (id, user) => { const admin = requireRole('super-admin'); return store.updateUser(id, user, admin.id); });
 
   handle('report:sales', (filter) => { requireAuth(); return store.salesReport(filter); });
-  handle('report:inventory', () => { const user = requireAuth(); return stripInventoryReportCost(store.inventoryReport(), user.role); });
+  // Full inventory access for all users now: cost/valuation figures are no
+  // longer stripped by role.
+  handle('report:inventory', () => { requireAuth(); return store.inventoryReport(); });
 
   handle('export:sales', async (filters) => { requireAuth(); const rows = store.listSales(filters); return exportCsv(datedFilename('Sales'), toCsv(SALE_COLUMNS, rows)); });
   handle('export:sale-items', async (filters) => {
@@ -226,23 +257,24 @@ function registerStoreHandlers() {
     const rows = store.listSales(filters).flatMap((sale) => sale.items.map((item) => ({ ...item, saleId: sale.id, createdAt: sale.createdAt, userId: sale.userId })));
     return exportCsv(datedFilename('Sale_Items'), toCsv(SALE_ITEM_COLUMNS, rows));
   });
-  handle('export:inventory', async (filters) => { const user = requireAuth(); const rows = store.listProducts(filters); return exportCsv(datedFilename('Inventory'), toCsv(inventoryColumns(user.role === 'super-admin'), rows)); });
+  handle('export:inventory', async (filters) => { requireAuth(); const rows = store.listProducts(filters); return exportCsv(datedFilename('Inventory'), toCsv(inventoryColumns(true), rows)); });
   handle('export:sales-report', async (filter) => { requireAuth(); const report = store.salesReport(filter); return exportCsv(datedFilename('Sales_Report'), toSectionedCsv(buildSalesReportSections(report))); });
   handle('export:inventory-report', async () => {
-    const user = requireAuth();
-    const report = stripInventoryReportCost(store.inventoryReport(), user.role);
-    return exportCsv(datedFilename('Inventory_Report'), toSectionedCsv(buildInventoryReportSections(report, user.role === 'super-admin')));
+    requireAuth();
+    const report = store.inventoryReport();
+    return exportCsv(datedFilename('Inventory_Report'), toSectionedCsv(buildInventoryReportSections(report, true)));
   });
 
+  // Bulk CSV import is now open to all users too (full inventory access).
   handle('import:choose-file', async () => {
-    requireRole('super-admin');
+    requireAuth();
     const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: [{ name: 'CSV files', extensions: ['csv'] }] });
     if (result.canceled || !result.filePaths.length) return null;
     const filePath = result.filePaths[0];
     return { fileName: path.basename(filePath), text: fs.readFileSync(filePath, 'utf8') };
   });
-  handle('import:preview', (text) => { requireRole('super-admin'); return store.previewImport(text); });
-  handle('import:commit', (text, duplicateStrategy) => { requireRole('super-admin'); return store.commitImport(text, duplicateStrategy); });
+  handle('import:preview', (text) => { requireAuth(); return store.previewImport(text); });
+  handle('import:commit', (text, duplicateStrategy) => { requireAuth(); return store.commitImport(text, duplicateStrategy); });
 }
 
 function createWindow() {
@@ -257,7 +289,14 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true,
+      // DevTools access is blocked only in packaged (production) builds, kept
+      // available under `npm start` for development. This is a deterrent,
+      // not a security boundary: every privileged action is authorized in
+      // this main process regardless of whether DevTools can be opened, so
+      // closing it off here changes nothing about what's actually protected.
+      devTools: !app.isPackaged
     }
   });
 

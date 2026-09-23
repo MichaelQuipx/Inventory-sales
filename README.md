@@ -72,6 +72,12 @@ The database is one JSON file, fully read and rewritten on every operation. That
 
 Voiding an archived sale still works and correctly restores stock.
 
+## Discounts
+
+Record Sale has a **Discount** field in the cart totals, next to Subtotal. Enter a fixed peso amount to deduct from the subtotal before completing the sale — the Grand Total updates live as you type. A discount can't be negative or larger than the subtotal (the server validates this even if the UI is bypassed).
+
+Every completed sale stores its `subtotal` (before discount), `discount`, and final `total` (after discount) separately. History's transaction details always show all three, and the printed receipt shows the Subtotal/Discount breakdown whenever a discount was applied (a sale with no discount just shows a single Total, as before). Dashboard and report totals reflect the final, discounted amount — the actual revenue collected.
+
 ## Units of measurement
 
 Each product is stocked and sold in exactly one unit, chosen when you add it: piece, pack, box, sack, kilogram, gram, liter, or milliliter.

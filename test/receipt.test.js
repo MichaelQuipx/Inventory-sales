@@ -46,3 +46,24 @@ test('buildReceiptHtml works even when processedByName is not provided', () => {
   const html = buildReceiptHtml(sampleSale, { paperWidth: '80mm' });
   assert.doesNotMatch(html, /Processed By/);
 });
+
+test('buildReceiptHtml shows Subtotal and Discount when a discount was applied', () => {
+  const discountedSale = { ...sampleSale, subtotal: 174.5, discount: 20, total: 154.5 };
+  const html = buildReceiptHtml(discountedSale, { paperWidth: '80mm' });
+  assert.match(html, /Subtotal/);
+  assert.match(html, /Discount/);
+  assert.match(html, /174\.50/);
+  assert.match(html, /-.?20\.00/);
+  assert.match(html, /154\.50/);
+});
+
+test('buildReceiptHtml shows the total number of items sold, using sale.itemCount when present', () => {
+  const html = buildReceiptHtml({ ...sampleSale, itemCount: 3 }, { paperWidth: '80mm' });
+  assert.match(html, /Items[\s\S]*?3/);
+});
+
+test('buildReceiptHtml derives item count from the items list when sale.itemCount is missing', () => {
+  // sampleSale (2 kg rice + 1 pc of the long-named item) has no itemCount field.
+  const html = buildReceiptHtml(sampleSale, { paperWidth: '80mm' });
+  assert.match(html, /Items[\s\S]*?3/);
+});

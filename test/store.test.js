@@ -23,12 +23,13 @@ function authenticatedStore() {
 test('product creation, sale completion, history, and stock deduction work together', () => {
   const { store, folder, admin } = authenticatedStore();
   try {
-    const product = store.createProduct({ name: 'Galvanized Nails', sku: 'HW-001', category: 'Hardware', price: 45.5, stock: 10, lowStockThreshold: 3 });
+    const product = store.createProduct({ name: 'Galvanized Nails', sku: 'HW-001', category: 'Hardware', price: 45.5, costPrice: 30, stock: 10, lowStockThreshold: 3 });
     assert.equal(store.getData().products.length, 1);
     const sale = store.completeSale([{ productId: product.id, quantity: 3 }], admin.id);
     assert.equal(sale.total, 136.5);
     assert.equal(sale.itemCount, 3);
     assert.equal(sale.userId, admin.id);
+    assert.equal(sale.items[0].costPrice, 30);
     const secondSale = store.completeSale([{ productId: product.id, quantity: 1 }], admin.id);
     assert.equal(secondSale.total, 45.5);
     assert.equal(store.getData().products[0].stock, 6);
@@ -39,13 +40,44 @@ test('product creation, sale completion, history, and stock deduction work toget
     assert.equal(dashboard.summary.transactionCount, 2);
     assert.equal(dashboard.summary.productsSold, 4);
     assert.equal(dashboard.summary.averageSale, 91);
+    // Profit = (45.5 - 30) * 4 units sold = 62
+    assert.equal(dashboard.summary.totalProfit, 62);
+    assert.equal(dashboard.summary.profitMargin, Number((62 / 182 * 100).toFixed(1)));
     assert.equal(dashboard.graph.reduce((sum, point) => sum + point.total, 0), 182);
+    assert.equal(dashboard.graph.reduce((sum, point) => sum + point.profit, 0), 62);
     for (const period of ['daily', 'weekly', 'monthly', 'yearly']) {
       const graph = store.dashboard(period).graph;
       assert.ok(graph.length > 0);
       assert.equal(graph.reduce((sum, point) => sum + point.total, 0), 182);
+      assert.equal(graph.reduce((sum, point) => sum + point.profit, 0), 62);
       assert.ok(graph.every((point) => point.tooltip));
     }
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('sale profit is snapshotted at sale time and unaffected by later cost-price changes', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const product = store.createProduct({ name: 'Engine Oil 1L', category: 'Motorparts', price: 320, costPrice: 250, stock: 10, lowStockThreshold: 2 });
+    store.completeSale([{ productId: product.id, quantity: 2 }], admin.id);
+    assert.equal(store.dashboard('daily').summary.totalProfit, 140); // (320-250)*2
+    store.updateProduct(product.id, { name: product.name, category: product.category, price: 320, costPrice: 300, stock: 8, lowStockThreshold: 2 });
+    // The already-completed sale's profit stays computed off the cost price at
+    // the time it was sold, not the product's new cost price.
+    assert.equal(store.dashboard('daily').summary.totalProfit, 140);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('a sale recorded before cost price existed falls back to the product\'s current cost price', () => {
+  const { store, folder, databasePath, admin } = authenticatedStore();
+  try {
+    const product = store.createProduct({ name: 'Spark Plug', category: 'Motorparts', price: 145, costPrice: 90, stock: 10, lowStockThreshold: 2 });
+    store.completeSale([{ productId: product.id, quantity: 2 }], admin.id);
+    // Simulate a legacy sale item saved before costPrice was ever captured.
+    const raw = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+    delete raw.sales[0].items[0].costPrice;
+    fs.writeFileSync(databasePath, JSON.stringify(raw), 'utf8');
+    assert.equal(store.dashboard('daily').summary.totalProfit, (145 - 90) * 2);
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });
 
@@ -500,5 +532,205 @@ test('archiveSalesBefore rejects an invalid cutoff date', () => {
   const { store, folder } = authenticatedStore();
   try {
     assert.throws(() => store.archiveSalesBefore('not-a-date'), /valid cutoff date/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+// ---- Sale discounts ----
+
+test('completeSale applies a discount, recording subtotal, discount, and the final total', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const nails = store.createProduct({ name: 'Nails', category: 'Hardware', price: 50, stock: 20, lowStockThreshold: 2 });
+    const sale = store.completeSale([{ productId: nails.id, quantity: 3 }], admin.id, 20);
+    assert.equal(sale.subtotal, 150);
+    assert.equal(sale.discount, 20);
+    assert.equal(sale.total, 130);
+    assert.equal(store.getSale(sale.id).total, 130);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('completeSale defaults to no discount when none is given, and treats it as zero', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const nails = store.createProduct({ name: 'Nails', category: 'Hardware', price: 50, stock: 20, lowStockThreshold: 2 });
+    const sale = store.completeSale([{ productId: nails.id, quantity: 2 }], admin.id);
+    assert.equal(sale.subtotal, 100);
+    assert.equal(sale.discount, 0);
+    assert.equal(sale.total, 100);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('completeSale rejects a negative discount and a discount larger than the subtotal', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const nails = store.createProduct({ name: 'Nails', category: 'Hardware', price: 50, stock: 20, lowStockThreshold: 2 });
+    assert.throws(() => store.completeSale([{ productId: nails.id, quantity: 1 }], admin.id, -5), /Discount must be zero or greater/);
+    assert.throws(() => store.completeSale([{ productId: nails.id, quantity: 1 }], admin.id, 100), /Discount cannot be greater than the subtotal/);
+    // A discount exactly equal to the subtotal (free item) is allowed.
+    const freeSale = store.completeSale([{ productId: nails.id, quantity: 1 }], admin.id, 50);
+    assert.equal(freeSale.total, 0);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('a discounted sale reports its final (discounted) total in dashboard and salesReport totals', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const nails = store.createProduct({ name: 'Nails', category: 'Hardware', price: 50, stock: 20, lowStockThreshold: 2 });
+    store.completeSale([{ productId: nails.id, quantity: 2 }], admin.id, 15);
+    const dashboard = store.dashboard('this-week');
+    assert.equal(dashboard.summary.totalSales, 85);
+    const report = store.salesReport('this-week');
+    assert.equal(report.summary.totalSales, 85);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('receipt paper width defaults to 80mm and can be saved as the default setting', () => {
+  const { store, folder } = authenticatedStore();
+  try {
+    assert.deepEqual(store.getSettings(), { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 });
+    const updated = store.updateSettings({ receiptPaperWidth: '58mm' });
+    assert.equal(updated.receiptPaperWidth, '58mm');
+    // Persists across reads, like the rest of the database.
+    assert.equal(store.getSettings().receiptPaperWidth, '58mm');
+    assert.throws(() => store.updateSettings({ receiptPaperWidth: '110mm' }), /Paper width must be 58mm or 80mm/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('centimeter and meter are available as fractional (divisible) units', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const wire = store.createProduct({ name: 'Electrical Wire', category: 'Hardware', unit: 'm', price: 25, stock: 100, lowStockThreshold: 10 });
+    assert.equal(wire.unit, 'm');
+    const sale = store.completeSale([{ productId: wire.id, quantity: 2.5 }], admin.id);
+    assert.equal(sale.total, 62.5);
+    assert.equal(store.getData().products[0].stock, 97.5);
+
+    const rope = store.createProduct({ name: 'Nylon Rope', category: 'Hardware', unit: 'cm', price: 2, stock: 500, lowStockThreshold: 50 });
+    assert.equal(rope.unit, 'cm');
+    store.completeSale([{ productId: rope.id, quantity: 37.5 }], admin.id);
+    assert.equal(store.getData().products[1].stock, 462.5);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('"load" is a fractional unit, so full/half/quarter dump-truck loads are all just quantities of the same unit', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const sand = store.createProduct({ name: 'Sand', category: 'Hardware', unit: 'load', price: 4000, costPrice: 2500, stock: 10, lowStockThreshold: 1 });
+    assert.equal(sand.unit, 'load');
+
+    // 1 Full Load
+    const fullLoad = store.completeSale([{ productId: sand.id, quantity: 1 }], admin.id);
+    assert.equal(fullLoad.total, 4000);
+    assert.equal(store.getData().products[0].stock, 9);
+
+    // 1/2 Load
+    const halfLoad = store.completeSale([{ productId: sand.id, quantity: 0.5 }], admin.id);
+    assert.equal(halfLoad.total, 2000);
+    assert.equal(store.getData().products[0].stock, 8.5);
+
+    // 2 Half Loads in one sale == 1 full load's worth
+    const twoHalfLoads = store.completeSale([{ productId: sand.id, quantity: 0.5 }, { productId: sand.id, quantity: 0.5 }], admin.id);
+    assert.equal(twoHalfLoads.total, 4000);
+    assert.equal(store.getData().products[0].stock, 7.5);
+
+    // Other units (piece, kg, sack, ...) keep working normally alongside "load".
+    const nails = store.createProduct({ name: 'Nails', category: 'Hardware', unit: 'kg', price: 60, stock: 20, lowStockThreshold: 2 });
+    store.completeSale([{ productId: nails.id, quantity: 1.5 }], admin.id);
+    assert.equal(store.getData().products.find((p) => p.id === nails.id).stock, 18.5);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('a Regular User\'s discount is capped by the configurable Settings limit; a Super Admin is unlimited', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const cashier = store.createUser({ name: 'Cashier One', username: 'cashier1', password: 'Password123', role: 'regular-user' });
+    const rice = store.createProduct({ name: 'Jasmine Rice', category: 'Rice', price: 100, costPrice: 80, stock: 100, lowStockThreshold: 5 });
+
+    // Default cap is 20%: a 100 subtotal allows at most a 20 discount.
+    assert.throws(
+      () => store.completeSale([{ productId: rice.id, quantity: 1 }], cashier.id, 25),
+      /Discount cannot exceed 20%/
+    );
+    const withinCap = store.completeSale([{ productId: rice.id, quantity: 1 }], cashier.id, 20);
+    assert.equal(withinCap.total, 80);
+
+    // A Super Admin is not subject to the cap.
+    const adminSale = store.completeSale([{ productId: rice.id, quantity: 1 }], admin.id, 90);
+    assert.equal(adminSale.total, 10);
+
+    // The cap itself is adjustable (e.g. by a Super Admin via Settings).
+    store.updateSettings({ maxRegularUserDiscountPercent: 50 });
+    const raised = store.completeSale([{ productId: rice.id, quantity: 1 }], cashier.id, 50);
+    assert.equal(raised.total, 50);
+    assert.throws(() => store.completeSale([{ productId: rice.id, quantity: 1 }], cashier.id, 51), /Discount cannot exceed 50%/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('a product\'s price/cost/stock changes are recorded in the audit log with old and new values', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const rice = store.createProduct({ name: 'Jasmine Rice', category: 'Rice', price: 100, costPrice: 80, stock: 50, lowStockThreshold: 5 });
+    store.updateProduct(rice.id, { name: 'Jasmine Rice', category: 'Rice', price: 120, costPrice: 80, stock: 50, lowStockThreshold: 5 }, admin.id);
+
+    const log = store.listAuditLog();
+    const priceChange = log.find((entry) => entry.action === 'Selling price changed');
+    assert.ok(priceChange, 'expected a "Selling price changed" audit entry');
+    assert.equal(priceChange.before, 100);
+    assert.equal(priceChange.after, 120);
+    assert.equal(priceChange.userId, admin.id);
+    assert.ok(priceChange.target.includes('Jasmine Rice'));
+
+    // Editing something unrelated to price/cost/stock shouldn't add noise.
+    const beforeCount = store.listAuditLog().length;
+    store.updateProduct(rice.id, { name: 'Jasmine Rice Premium', category: 'Rice', price: 120, costPrice: 80, stock: 50, lowStockThreshold: 5 }, admin.id);
+    assert.equal(store.listAuditLog().length, beforeCount);
+
+    store.archiveProduct(rice.id, admin.id);
+    assert.ok(store.listAuditLog().some((entry) => entry.action === 'Product archived' && entry.userId === admin.id));
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('completed sales, discounts, and voids are all recorded in the audit log', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const rice = store.createProduct({ name: 'Jasmine Rice', category: 'Rice', price: 100, costPrice: 80, stock: 50, lowStockThreshold: 5 });
+    const sale = store.completeSale([{ productId: rice.id, quantity: 1 }], admin.id, 10);
+    assert.ok(store.listAuditLog().some((entry) => entry.action === 'Sale completed' && entry.target === sale.id));
+    assert.ok(store.listAuditLog().some((entry) => entry.action === 'Discount applied' && entry.target === sale.id && entry.after === 10));
+
+    store.voidSale(sale.id, admin.id, 'Customer changed their mind');
+    assert.ok(store.listAuditLog().some((entry) => entry.action === 'Sale voided' && entry.target === sale.id));
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('user creation and role changes are recorded in the audit log', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const cashier = store.createUser({ name: 'Cashier One', username: 'cashier1', password: 'Password123', role: 'regular-user' }, admin.id);
+    assert.ok(store.listAuditLog().some((entry) => entry.action === 'User created' && entry.userId === admin.id));
+
+    store.updateUser(cashier.id, { name: cashier.name, username: cashier.username, role: 'super-admin', active: true }, admin.id);
+    const roleChange = store.listAuditLog().find((entry) => entry.action === 'User role changed');
+    assert.ok(roleChange);
+    assert.equal(roleChange.before, 'regular-user');
+    assert.equal(roleChange.after, 'super-admin');
+    assert.equal(roleChange.userId, admin.id);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('a sale always uses the product\'s current authoritative price, never a price supplied by the caller', () => {
+  const { store, folder, admin } = authenticatedStore();
+  try {
+    const rice = store.createProduct({ name: 'Jasmine Rice', category: 'Rice', price: 100, costPrice: 80, stock: 50, lowStockThreshold: 5 });
+    // Simulates a tampered renderer trying to smuggle its own price/subtotal.
+    const sale = store.completeSale([{ productId: rice.id, quantity: 2, price: 1, unitPrice: 1, subtotal: 2 }], admin.id);
+    assert.equal(sale.items[0].unitPrice, 100);
+    assert.equal(sale.total, 200);
+
+    // Changing the price afterward never rewrites the already-completed sale
+    // (the "change price, sell, change it back" loophole).
+    store.updateProduct(rice.id, { name: 'Jasmine Rice', category: 'Rice', price: 50, costPrice: 80, stock: 48, lowStockThreshold: 5 }, admin.id);
+    assert.equal(store.getSale(sale.id).items[0].unitPrice, 100);
+    assert.equal(store.getSale(sale.id).total, 200);
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });

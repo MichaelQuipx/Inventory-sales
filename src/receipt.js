@@ -37,6 +37,8 @@ function buildReceiptHtml(sale, { paperWidth = '80mm', processedByName = null } 
       <tr><td class="item-detail">${lineDetail}</td><td class="amount">${money(item.subtotal)}</td></tr>`;
   }).join('');
 
+  const itemCount = typeof sale.itemCount === 'number' ? sale.itemCount : (sale.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+
   const metaRows = [
     ['Receipt #', sale.id],
     ['Date', formatDateTime(sale.createdAt)],
@@ -85,6 +87,9 @@ function buildReceiptHtml(sale, { paperWidth = '80mm', processedByName = null } 
   <table>${itemRows}</table>
   <hr>
   <table class="totals-table">
+    <tr><td>Items</td><td class="amount">${formatQuantity(itemCount)}</td></tr>
+    ${sale.discount ? `<tr><td>Subtotal</td><td class="amount">${money(sale.subtotal ?? sale.total)}</td></tr>
+    <tr><td>Discount</td><td class="amount">-${money(sale.discount)}</td></tr>` : ''}
     <tr class="grand-total"><td>TOTAL</td><td class="amount">${money(sale.total)}</td></tr>
   </table>
   <hr>

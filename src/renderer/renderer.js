@@ -2,7 +2,7 @@ const app = document.querySelector('#app');
 const modalRoot = document.querySelector('#modal-root');
 const toastRoot = document.querySelector('#toast-root');
 
-const state = { page: 'dashboard', products: [], sales: [], cart: [], categories: [], units: [], userNames: [], users: [], currentUser: null, dashboardFilter: { type: 'this-week', start: '', end: '', userId: '' }, inventoryPagination: { page: 1, pageSize: 20 }, historyPagination: { page: 1, pageSize: 20 }, usersPagination: { page: 1, pageSize: 20 } };
+const state = { page: 'dashboard', products: [], sales: [], cart: [], discount: 0, categories: [], units: [], userNames: [], users: [], currentUser: null, receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20, dashboardFilter: { type: 'this-week', start: '', end: '', userId: '' }, inventoryPagination: { page: 1, pageSize: 20 }, historyPagination: { page: 1, pageSize: 20 }, usersPagination: { page: 1, pageSize: 20 }, auditPagination: { page: 1, pageSize: 25 } };
 const money = new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' });
 const dateTime = new Intl.DateTimeFormat('en-PH', { dateStyle: 'medium', timeStyle: 'short' });
 
@@ -29,6 +29,10 @@ function activeProducts() { return state.products.filter((product) => !product.a
 function isSuperAdmin() { return state.currentUser?.role === 'super-admin'; }
 function userName(userId) { return state.userNames.find((user) => user.id === userId)?.name || 'Unknown user'; }
 function unitDef(value) { return state.units.find((unit) => unit.value === value) || state.units[0] || { value: 'piece', label: 'Piece', shortLabel: 'pc', shortLabelPlural: 'pcs', fractional: false }; }
+// Most fractional units (kg, liter, ...) allow fine thousandths; a unit can
+// override this with its own coarser `step` (e.g. "load" moves in quarters,
+// since that's how dump-truck loads are actually ordered/priced).
+function quantityStep(def) { return String(def.step ?? (def.fractional ? 0.001 : 1)); }
 function unitShortLabel(value, quantity) { const def = unitDef(value); return Number(quantity) === 1 ? def.shortLabel : def.shortLabelPlural; }
 // Mirrors store.js's roundQuantity so client-side cart totals never drift from
 // what the backend will actually record.
@@ -58,9 +62,17 @@ async function refreshData() {
   state.categories = await window.kjStore.getCategories();
   state.units = await window.kjStore.getUnits();
   state.userNames = await window.kjStore.getUserNames();
+  try {
+    const settings = await window.kjStore.getSettings();
+    state.receiptPaperWidth = settings.receiptPaperWidth || '80mm';
+    state.maxRegularUserDiscountPercent = settings.maxRegularUserDiscountPercent ?? 20;
+  } catch { /* keep previous/default values */ }
 }
+// Pages a Regular User (Cashier) cannot open. Dashboard stays Super-Admin-only;
+// Inventory is open to Regular Users again (they can add/edit products, just
+// not view the Dashboard's business-wide sales/profit figures).
+const SUPER_ADMIN_ONLY_PAGES = ['dashboard', 'users', 'audit'];
 function setPage(page) {
-  if (page === 'users' && !isSuperAdmin()) page = 'dashboard';
   state.page = page;
   document.querySelectorAll('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.page === page));
   render();
@@ -194,6 +206,7 @@ async function renderDashboard() {
         ${summaryCard('Transactions', summary.transactionCount, 'Completed sales in this period')}
         ${summaryCard('Items sold', summary.productsSold, 'Quantity from completed sales')}
         ${summaryCard('Average sale', formatMoney(summary.averageSale), 'Per completed transaction')}
+        ${isSuperAdmin() ? summaryCard('Total profit', formatMoney(summary.totalProfit), `${summary.profitMargin}% margin \u00b7 selling price minus cost price`) : ''}
       </section>
       <section class="panel chart-panel"><div class="section-heading"><div><h2>Sales performance</h2><p>Completed sales by period.</p></div>
         ${dashboardControls()}</div>
@@ -251,10 +264,25 @@ function addToCart(productId) {
 function cartDetails() { return state.cart.map((cartItem) => ({ ...cartItem, product: activeProducts().find((product) => product.id === cartItem.productId) })).filter((item) => item.product); }
 function renderCart() {
   const cart = app.querySelector('#cart'); const items = cartDetails(); const subtotal = items.reduce((total, item) => total + (item.product.price * item.quantity), 0);
-  cart.innerHTML = `<div class="cart-heading"><div><p class="eyebrow">CURRENT SALE</p><h2>Cart</h2></div><span class="cart-count">${items.length} item${items.length === 1 ? '' : 's'}</span></div><div class="cart-items">${items.length ? items.map((item) => { const def = unitDef(item.product.unit); const quantityControl = def.fractional ? `<div class="quantity-control fractional"><input type="number" min="0.001" step="0.001" max="${item.product.stock}" value="${formatQuantity(item.quantity, true)}" data-quantity-input="${item.productId}"><span class="quantity-unit">${def.shortLabel}</span></div>` : `<div class="quantity-control"><button data-quantity="${item.productId}" data-change="-1">&minus;</button><span>${item.quantity}</span><button data-quantity="${item.productId}" data-change="1">+</button></div>`; return `<article class="cart-item"><div><h3>${escapeHtml(item.product.name)}</h3><p>${formatMoney(item.product.price)} per ${def.shortLabel}</p></div><button class="icon-button remove" data-remove="${item.productId}" title="Remove item">&times;</button><div class="cart-line">${quantityControl}<strong>${formatMoney(item.product.price * item.quantity)}</strong></div></article>`; }).join('') : emptyState('Your cart is empty', 'Click a product card to add it to this sale.')}</div><div class="cart-totals"><div><span>Subtotal</span><strong>${formatMoney(subtotal)}</strong></div><div><span>Items</span><strong>${items.length}</strong></div><div class="grand-total"><span>Grand total</span><strong>${formatMoney(subtotal)}</strong></div><button id="complete-sale" class="primary-button wide" ${items.length ? '' : 'disabled'}>Complete Sale</button></div>`;
+  const discount = Math.min(Math.max(0, Number(state.discount) || 0), subtotal);
+  const grandTotal = Math.max(0, subtotal - discount);
+  cart.innerHTML = `<div class="cart-heading"><div><p class="eyebrow">CURRENT SALE</p><h2>Cart</h2></div><span class="cart-count">${items.length} item${items.length === 1 ? '' : 's'}</span></div><div class="cart-items">${items.length ? items.map((item) => { const def = unitDef(item.product.unit); const quantityControl = `<div class="quantity-control${def.fractional ? ' fractional' : ''}">${def.fractional ? '' : `<button type="button" data-quantity="${item.productId}" data-change="-1" aria-label="Decrease quantity">&minus;</button>`}<input type="number" min="${def.fractional ? quantityStep(def) : '1'}" step="${quantityStep(def)}" max="${item.product.stock}" value="${formatQuantity(item.quantity, def.fractional)}" data-quantity-input="${item.productId}">${def.fractional ? `<span class="quantity-unit">${def.shortLabel}</span>` : `<button type="button" data-quantity="${item.productId}" data-change="1" aria-label="Increase quantity">+</button>`}</div>`; return `<article class="cart-item"><div><h3>${escapeHtml(item.product.name)}</h3><p>${formatMoney(item.product.price)} per ${def.shortLabel} &middot; ${formatQuantity(item.product.stock, def.fractional)} in stock</p></div><button class="icon-button remove" data-remove="${item.productId}" title="Remove item">&times;</button><div class="cart-line">${quantityControl}<strong>${formatMoney(item.product.price * item.quantity)}</strong></div></article>`; }).join('') : emptyState('Your cart is empty', 'Click a product card to add it to this sale.')}</div><div class="cart-totals"><div><span>Subtotal</span><strong id="cart-subtotal">${formatMoney(subtotal)}</strong></div><div><span>Items</span><strong>${items.length}</strong></div><div class="discount-row"><span>Discount</span><input id="cart-discount" type="number" min="0" step="0.01" max="${subtotal}" value="${state.discount ? state.discount : ''}" placeholder="0.00" ${items.length ? '' : 'disabled'}></div>${!isSuperAdmin() && items.length ? `<p class="discount-hint">Max discount: ${formatMoney(subtotal * (state.maxRegularUserDiscountPercent / 100))} (${state.maxRegularUserDiscountPercent}% of subtotal)</p>` : ''}<div class="grand-total"><span>Grand total</span><strong id="cart-grand-total">${formatMoney(grandTotal)}</strong></div><button id="complete-sale" class="primary-button wide" ${items.length ? '' : 'disabled'}>Complete Sale</button></div>`;
   cart.querySelectorAll('[data-quantity]').forEach((button) => button.addEventListener('click', () => changeQuantity(button.dataset.quantity, Number(button.dataset.change))));
-  cart.querySelectorAll('[data-quantity-input]').forEach((input) => input.addEventListener('change', () => setQuantity(input.dataset.quantityInput, Number(input.value))));
+  // change fires on blur/Enter so a half-typed number (e.g. "1" while typing
+  // "12") never gets clamped mid-keystroke; setQuantity() does the validation.
+  cart.querySelectorAll('[data-quantity-input]').forEach((input) => {
+    input.addEventListener('change', () => setQuantity(input.dataset.quantityInput, Number(input.value)));
+    input.addEventListener('keydown', (event) => { if (event.key === 'Enter') input.blur(); });
+  });
   cart.querySelectorAll('[data-remove]').forEach((button) => button.addEventListener('click', () => { state.cart = state.cart.filter((item) => item.productId !== button.dataset.remove); renderCart(); }));
+  // Updates state and the grand-total display directly rather than calling
+  // renderCart() on every keystroke, so the input never loses focus while typing.
+  cart.querySelector('#cart-discount').addEventListener('input', (event) => {
+    const raw = Number(event.target.value);
+    state.discount = Number.isFinite(raw) && raw >= 0 ? raw : 0;
+    const clamped = Math.min(state.discount, subtotal);
+    cart.querySelector('#cart-grand-total').textContent = formatMoney(Math.max(0, subtotal - clamped));
+  });
   cart.querySelector('#complete-sale').addEventListener('click', completeSale);
 }
 function changeQuantity(productId, change) { const cartItem = state.cart.find((item) => item.productId === productId); const product = activeProducts().find((item) => item.id === productId); if (cartItem.quantity + change < 1) state.cart = state.cart.filter((item) => item.productId !== productId); else if (cartItem.quantity + change > product.stock) notify(`Only ${product.stock} ${product.name} available.`, 'error'); else cartItem.quantity += change; renderCart(); }
@@ -267,15 +295,22 @@ function setQuantity(productId, value) {
   if (rounded > product.stock) { notify(`Only ${formatQuantity(product.stock, true)} ${unitShortLabel(product.unit, product.stock)} of ${product.name} available.`, 'error'); cartItem.quantity = product.stock; } else { cartItem.quantity = rounded; }
   renderCart();
 }
-async function completeSale() { try { const sale = await window.kjStore.completeSale(state.cart); state.cart = []; await refreshData(); renderSale(); notify(`Sale ${sale.id} completed successfully.`); } catch (error) { showError(error); await refreshData(); renderSale(); } }
+async function completeSale() { try { const sale = await window.kjStore.completeSale(state.cart, state.discount); state.cart = []; state.discount = 0; await refreshData(); renderSale(); notify(`Sale ${sale.id} completed successfully.`); openSaleCompleteModal(sale); } catch (error) { showError(error); await refreshData(); renderSale(); } }
+// Shown right after a sale is saved so the cashier can print a receipt for the
+// customer immediately, without hunting for it in History afterward.
+function openSaleCompleteModal(sale) {
+  openModal(`<div class="modal-header"><div><p class="eyebrow">SALE COMPLETED</p><h2>${escapeHtml(sale.id)}</h2><p>${sale.itemCount} item${sale.itemCount === 1 ? '' : 's'} &middot; Total ${formatMoney(sale.total)}</p></div><button data-close-modal class="icon-button">&times;</button></div><div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Done, no receipt</button><button id="print-now-button" class="primary-button">Print Receipt</button></div>`);
+  modalRoot.querySelector('#print-now-button').addEventListener('click', () => printSaleReceipt(sale.id));
+}
 
 function renderInventory() {
   const categoryOptions = state.categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('');
-  app.innerHTML = `${pageHeader('CATALOG', 'Inventory', 'Add, edit, and monitor the products you sell.', '<div class="header-actions"><button id="import-inventory" class="secondary-button">Import CSV</button><button id="export-inventory" class="secondary-button">Export CSV</button><button id="add-product" class="primary-button">+ Add New Product</button></div>')}<section class="panel"><div class="table-filters"><input id="inventory-search" type="search" placeholder="Search product name or SKU"><select id="inventory-category"><option value="">All categories</option>${categoryOptions}</select></div><div id="inventory-table"></div></section>`;
+  // Full inventory access for all users now, including bulk CSV Import.
+  app.innerHTML = `${pageHeader('CATALOG', 'Inventory', 'Add, edit, and monitor the products you sell.', `<div class="header-actions"><button id="import-inventory" class="secondary-button">Import CSV</button><button id="export-inventory" class="secondary-button">Export CSV</button><button id="add-product" class="primary-button">+ Add New Product</button></div>`)}<section class="panel"><div class="table-filters"><input id="inventory-search" type="search" placeholder="Search product name or SKU"><select id="inventory-category"><option value="">All categories</option>${categoryOptions}</select></div><div id="inventory-table"></div></section>`;
   const resetAndRender = () => { state.inventoryPagination.page = 1; renderInventoryTable(); };
-  app.querySelector('#add-product').addEventListener('click', () => openProductModal()); app.querySelector('#inventory-search').addEventListener('input', resetAndRender); app.querySelector('#inventory-category').addEventListener('change', resetAndRender); renderInventoryTable();
+  app.querySelector('#add-product')?.addEventListener('click', () => openProductModal()); app.querySelector('#inventory-search').addEventListener('input', resetAndRender); app.querySelector('#inventory-category').addEventListener('change', resetAndRender); renderInventoryTable();
   app.querySelector('#export-inventory').addEventListener('click', exportInventoryCsv);
-  app.querySelector('#import-inventory').addEventListener('click', startInventoryImport);
+  app.querySelector('#import-inventory')?.addEventListener('click', startInventoryImport);
 }
 async function exportInventoryCsv() {
   const button = app.querySelector('#export-inventory');
@@ -339,7 +374,20 @@ function renderInventoryTable() {
   if (!filtered.length) { table.innerHTML = emptyState('No products yet', 'Add your first product to start managing inventory.', '<button class="secondary-button" id="empty-add">Add New Product</button>'); document.querySelector('#empty-add')?.addEventListener('click', () => openProductModal()); return; }
   const pageState = state.inventoryPagination;
   const products = paginate(filtered, pageState);
-  table.innerHTML = `<div class="data-table-wrap"><table><thead><tr><th>Product</th><th>Category</th><th>Price</th><th>Stock</th><th>Status</th><th aria-label="Actions"></th></tr></thead><tbody>${products.map((product) => { const [label, style] = productStatus(product); const def = unitDef(product.unit); return `<tr><td><strong>${escapeHtml(product.name)}</strong><small>${product.sku ? `SKU: ${escapeHtml(product.sku)}` : 'No SKU'}</small></td><td>${escapeHtml(product.category)}</td><td>${formatMoney(product.price)} <small>/ ${def.shortLabel}</small></td><td>${formatQuantity(product.stock, def.fractional)} ${unitShortLabel(product.unit, product.stock)}</td><td><span class="badge ${style}">${label}</span></td><td class="row-actions">${iconActionButton({ name: 'edit', label: 'Edit', attr: `data-edit="${product.id}"` })}${iconActionButton({ name: 'archive', label: 'Archive', attr: `data-archive="${product.id}"`, extraClass: 'danger' })}</td></tr>`; }).join('')}</tbody></table></div>${paginationMarkup(pageState, filtered.length, 'products')}`;
+  // Cost price and per-unit profit are margin-sensitive, so these columns only
+  // render for Super Admins -- Regular Users keep seeing the existing columns.
+  // Cost/profit columns are now shown to all users (full inventory access).
+  const showProfit = true;
+  // Potential profit if every unit of currently-filtered stock sold at its
+  // listed price -- computed over the full filtered set, not just this page.
+  const profitSummaryBar = showProfit ? (() => {
+    const totalProfit = filtered.reduce((sum, product) => sum + (product.stock * (product.price - (product.costPrice || 0))), 0);
+    const totalRetailValue = filtered.reduce((sum, product) => sum + (product.stock * product.price), 0);
+    const margin = totalRetailValue > 0 ? Math.round((totalProfit / totalRetailValue) * 1000) / 10 : null;
+    return `<div class="inventory-profit-summary"><span>Potential profit on ${filtered.length} product${filtered.length === 1 ? '' : 's'} currently in stock</span><strong class="${totalProfit < 0 ? 'profit-negative' : 'profit-positive'}">${formatMoney(totalProfit)}</strong>${margin !== null ? `<small>${margin}% margin</small>` : ''}</div>`;
+  })() : '';
+  const profitColumns = showProfit ? '<th>Cost</th><th>Profit</th>' : '';
+  table.innerHTML = `${profitSummaryBar}<div class="data-table-wrap"><table><thead><tr><th>Product</th><th>Category</th><th>Price</th>${profitColumns}<th>Stock</th><th>Status</th><th aria-label="Actions"></th></tr></thead><tbody>${products.map((product) => { const [label, style] = productStatus(product); const def = unitDef(product.unit); const profitCells = showProfit ? (() => { const profit = product.price - (product.costPrice || 0); const margin = product.price > 0 ? Math.round((profit / product.price) * 1000) / 10 : null; return `<td>${formatMoney(product.costPrice || 0)}</td><td class="${profit < 0 ? 'profit-negative' : 'profit-positive'}">${formatMoney(profit)}${margin !== null ? `<small> (${margin}%)</small>` : ''}</td>`; })() : ''; return `<tr><td><strong>${escapeHtml(product.name)}</strong><small>${product.sku ? `SKU: ${escapeHtml(product.sku)}` : 'No SKU'}</small></td><td>${escapeHtml(product.category)}</td><td>${formatMoney(product.price)} <small>/ ${def.shortLabel}</small></td>${profitCells}<td>${formatQuantity(product.stock, def.fractional)} ${unitShortLabel(product.unit, product.stock)}</td><td><span class="badge ${style}">${label}</span></td><td class="row-actions">${iconActionButton({ name: 'edit', label: 'Edit', attr: `data-edit="${product.id}"` })}${iconActionButton({ name: 'archive', label: 'Archive', attr: `data-archive="${product.id}"`, extraClass: 'danger' })}</td></tr>`; }).join('')}</tbody></table></div>${paginationMarkup(pageState, filtered.length, 'products')}`;
   table.querySelectorAll('[data-edit]').forEach((button) => button.addEventListener('click', () => openProductModal(activeProducts().find((item) => item.id === button.dataset.edit)))); table.querySelectorAll('[data-archive]').forEach((button) => button.addEventListener('click', () => confirmArchive(button.dataset.archive)));
   bindPagination(table, pageState, renderInventoryTable);
 }
@@ -367,9 +415,12 @@ async function renderHistoryTable() {
     if (!allSales.length) { table.innerHTML = emptyState('No transactions found', 'Completed sales will appear here.'); return; }
     const pageState = state.historyPagination;
     const sales = paginate(allSales, pageState);
-    table.innerHTML = `<div class="data-table-wrap"><table><thead><tr><th>Transaction ID</th><th>Date & time</th><th>Processed By</th><th>Items</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${sales.map((sale) => `<tr><td><strong>${escapeHtml(sale.id)}</strong></td><td>${dateTime.format(new Date(sale.createdAt))}</td><td>${sale.userId ? escapeHtml(userName(sale.userId)) : '&mdash;'}</td><td>${sale.itemCount}</td><td>${formatMoney(sale.total)}</td><td><span class="badge ${sale.status === 'Voided' ? 'danger' : 'success'}">${sale.status}</span></td><td class="row-actions">${iconActionButton({ name: 'view', label: 'View details', attr: `data-sale-detail="${sale.id}"` })}${iconActionButton({ name: 'printer', label: 'Print Receipt', attr: `data-print-receipt="${sale.id}"` })}${isSuperAdmin() && sale.status !== 'Voided' ? iconActionButton({ name: 'void', label: 'Void Sale', attr: `data-void-sale="${sale.id}"`, extraClass: 'danger' }) : ''}</td></tr>`).join('')}</tbody></table></div>${paginationMarkup(pageState, allSales.length, 'transactions')}`;
+    table.innerHTML = `<div class="data-table-wrap"><table><thead><tr><th>Transaction ID</th><th>Date & time</th><th>Processed By</th><th>Items Sold</th><th>Qty</th><th>Discount</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${sales.map((sale) => { const itemsCell = !sale.items.length ? '&mdash;' : sale.items.length === 1 ? `<span class="history-items-cell">${escapeHtml(sale.items[0].productName)}</span>` : `<span class="history-items-cell">${escapeHtml(sale.items[0].productName)}</span> <button type="button" class="link-button" data-sale-items="${sale.id}">+${sale.items.length - 1} more</button>`; return `<tr><td><strong>${escapeHtml(sale.id)}</strong></td><td>${dateTime.format(new Date(sale.createdAt))}</td><td>${sale.userId ? escapeHtml(userName(sale.userId)) : '&mdash;'}</td><td>${itemsCell}</td><td>${sale.itemCount}</td><td>${sale.discount ? formatMoney(sale.discount) : '&mdash;'}</td><td>${formatMoney(sale.total)}</td><td><span class="badge ${sale.status === 'Voided' ? 'danger' : 'success'}">${sale.status}</span></td><td class="row-actions">${iconActionButton({ name: 'view', label: 'View details', attr: `data-sale-detail="${sale.id}"` })}${iconActionButton({ name: 'printer', label: 'Print Receipt', attr: `data-print-receipt="${sale.id}"` })}${isSuperAdmin() && sale.status !== 'Voided' ? iconActionButton({ name: 'void', label: 'Void Sale', attr: `data-void-sale="${sale.id}"`, extraClass: 'danger' }) : ''}</td></tr>`; }).join('')}</tbody></table></div>${paginationMarkup(pageState, allSales.length, 'transactions')}`;
     table.querySelectorAll('[data-sale-detail]').forEach((button) => button.addEventListener('click', () => openSaleDetail(button.dataset.saleDetail)));
-    table.querySelectorAll('[data-print-receipt]').forEach((button) => button.addEventListener('click', () => printSaleReceipt(button.dataset.printReceipt, button)));
+    // "+N more" opens the same item-by-item breakdown as View Details, rather
+    // than a second, subtly-different modal to maintain.
+    table.querySelectorAll('[data-sale-items]').forEach((button) => button.addEventListener('click', () => openSaleDetail(button.dataset.saleItems)));
+    table.querySelectorAll('[data-print-receipt]').forEach((button) => button.addEventListener('click', () => printSaleReceipt(button.dataset.printReceipt)));
     table.querySelectorAll('[data-void-sale]').forEach((button) => button.addEventListener('click', () => openVoidSaleModal(button.dataset.voidSale)));
     bindPagination(table, pageState, renderHistoryTable);
   } catch (error) { table.innerHTML = errorView(error); }
@@ -437,38 +488,88 @@ function openVoidSaleModal(saleId) {
   });
 }
 
-// ---- Print Receipt (built from scratch: no prior receipt/print code existed) ----
+// ---- Print Receipt: Complete Sale -> Print Receipt -> Preview -> Print ----
+//
+// The preview modal renders the exact HTML that would be sent to the printer
+// (fetched from the main process, same buildReceiptHtml() used for printing),
+// inside a sandboxed iframe sized to the chosen paper width, so what's shown
+// on screen is a true WYSIWYG match -- no separate preview-only layout to
+// keep in sync. Printing itself always goes through Electron's native
+// print dialog (silent: false in main.js), so any installed Windows printer
+// -- including "Microsoft Print to PDF" -- works for testing without a
+// physical thermal printer.
+function openReceiptPreviewModal(saleId) {
+  let currentWidth = state.receiptPaperWidth || '80mm';
+  openModal(`<div class="modal-header"><div><p class="eyebrow">RECEIPT PREVIEW</p><h2>${escapeHtml(saleId)}</h2><p>Choose a paper width, then print using any installed Windows printer.</p></div><button data-close-modal class="icon-button">&times;</button></div>
+    <div class="receipt-preview-toolbar"><div class="paper-toggle" role="group" aria-label="Receipt paper width"><button type="button" class="paper-toggle-btn" data-paper-width="58mm">58mm</button><button type="button" class="paper-toggle-btn" data-paper-width="80mm">80mm</button></div></div>
+    <div class="receipt-preview-frame-wrap"><iframe id="receipt-preview-frame" class="receipt-preview-frame" title="Receipt preview" sandbox="allow-same-origin"></iframe></div>
+    <div id="receipt-preview-error"></div>
+    <div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Close</button><button id="receipt-print-button" class="primary-button">Print</button></div>`);
 
-function choosePaperWidth() {
-  return new Promise((resolve) => {
-    openModal(`<div class="modal-header"><div><h2>Print Receipt</h2><p>Choose the thermal paper width for this printer.</p></div><button data-close-modal class="icon-button">&times;</button></div><div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Cancel</button><button id="width-58" class="secondary-button">58mm</button><button id="width-80" class="primary-button">80mm</button></div>`);
-    let settled = false;
-    const finish = (value) => { if (settled) return; settled = true; resolve(value); closeModal(); };
-    modalRoot.querySelector('#width-58').addEventListener('click', () => finish('58mm'));
-    modalRoot.querySelector('#width-80').addEventListener('click', () => finish('80mm'));
-    modalRoot.querySelectorAll('[data-close-modal]').forEach((element) => element.addEventListener('click', () => finish(null)));
-    modalRoot.querySelector('.modal-backdrop').addEventListener('click', (event) => { if (event.target === event.currentTarget) finish(null); });
+  const frame = modalRoot.querySelector('#receipt-preview-frame');
+  const errorBox = modalRoot.querySelector('#receipt-preview-error');
+  const printButton = modalRoot.querySelector('#receipt-print-button');
+
+  function setActiveToggle() {
+    modalRoot.querySelectorAll('[data-paper-width]').forEach((btn) => btn.classList.toggle('active', btn.dataset.paperWidth === currentWidth));
+    frame.style.width = currentWidth === '58mm' ? '219px' : '302px'; // ~mm-to-px at 96dpi, matches the printed @page size
+  }
+  async function loadPreview() {
+    setActiveToggle();
+    errorBox.innerHTML = '';
+    try {
+      const html = await window.kjStore.getReceiptPreview(saleId, currentWidth);
+      frame.srcdoc = html;
+    } catch (error) {
+      errorBox.innerHTML = `<p class="form-error">${escapeHtml(error?.message || 'Could not load the receipt preview.')}</p>`;
+    }
+  }
+  // Auto-fits the iframe's height to the receipt's actual content (item count
+  // varies per sale) instead of a fixed guess, capped so a long receipt
+  // scrolls inside the preview rather than pushing the modal off-screen.
+  frame.addEventListener('load', () => {
+    try {
+      const contentHeight = frame.contentDocument.documentElement.scrollHeight;
+      frame.style.height = `${Math.min(contentHeight + 4, Math.round(window.innerHeight * 0.6))}px`;
+    } catch { /* preview still shows even if auto-height can't be measured */ }
   });
+
+  modalRoot.querySelectorAll('[data-paper-width]').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.paperWidth === currentWidth) return;
+    currentWidth = button.dataset.paperWidth;
+    state.receiptPaperWidth = currentWidth; // remembered as the default for next time
+    window.kjStore.updateSettings({ receiptPaperWidth: currentWidth }).catch(() => {});
+    loadPreview();
+  }));
+  printButton.addEventListener('click', async () => {
+    if (printButton.disabled) return;
+    printButton.disabled = true;
+    const originalLabel = printButton.textContent;
+    printButton.textContent = 'Printing...';
+    try {
+      const result = await window.kjStore.printReceipt(saleId, currentWidth);
+      if (result.printed) { notify('Receipt sent to the printer.'); closeModal(); return; }
+      if (!result.cancelled) notify(`Could not print the receipt${result.reason ? ` (${result.reason})` : ''}.`, 'error');
+    } catch (error) { showError(error); } finally { printButton.disabled = false; printButton.textContent = originalLabel; }
+  });
+
+  loadPreview();
 }
-async function printSaleReceipt(saleId, button) {
-  if (button.disabled) return; // guards against repeated clicks spawning multiple print jobs
-  const paperWidth = await choosePaperWidth();
-  if (!paperWidth) return; // user canceled the width choice
-  button.disabled = true;
-  const originalLabel = button.textContent;
-  button.textContent = 'Printing...';
-  try {
-    const result = await window.kjStore.printReceipt(saleId, paperWidth);
-    if (result.printed) notify('Receipt sent to the printer.');
-    else if (!result.cancelled) notify(`Could not print the receipt${result.reason ? ` (${result.reason})` : ''}.`, 'error');
-  } catch (error) { showError(error); } finally { button.disabled = false; button.textContent = originalLabel; }
-}
+// History's "Print Receipt" action and the post-sale prompt both funnel
+// through the same preview modal, so a fresh sale and a historical one print
+// identically.
+function printSaleReceipt(saleId) { openReceiptPreviewModal(saleId); }
 
 function render() {
+  if (SUPER_ADMIN_ONLY_PAGES.includes(state.page) && !isSuperAdmin()) {
+    state.page = 'sale';
+    document.querySelectorAll('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.page === 'sale'));
+  }
   if (state.page === 'dashboard') renderDashboard();
   else if (state.page === 'sale') renderSale();
   else if (state.page === 'inventory') renderInventory();
   else if (state.page === 'users') renderUsers();
+  else if (state.page === 'audit') renderAuditLog();
   else renderHistory();
 }
 function closeModal() { modalRoot.innerHTML = ''; }
@@ -478,21 +579,48 @@ function openProductModal(product = null) {
   const selectedUnit = product?.unit || 'piece';
   const unitOptions = state.units.map((unit) => `<option value="${unit.value}" ${selectedUnit === unit.value ? 'selected' : ''}>${escapeHtml(unit.label)}</option>`).join('');
   const startingDef = unitDef(selectedUnit);
-  openModal(`<div class="modal-header"><div><h2>${title}</h2><p>Enter the product details below.</p></div><button data-close-modal class="icon-button">&times;</button></div><form id="product-form"><div class="form-grid"><label class="full">Product name<input name="name" required maxlength="100" value="${escapeHtml(product?.name || '')}"></label><label>SKU / barcode<input name="sku" maxlength="80" value="${escapeHtml(product?.sku || '')}"></label><label>Category<select name="category" required><option value="">Choose category</option>${categoryOptions}</select></label><label>Unit of measurement<select name="unit" id="product-unit">${unitOptions}</select></label><label>Selling price<input name="price" type="number" min="0" step="0.01" required value="${product?.price ?? ''}"></label><label>Stock quantity<input name="stock" id="product-stock" type="number" min="0" step="${startingDef.fractional ? '0.001' : '1'}" required value="${product?.stock ?? ''}"></label><label>Low-stock level<input name="lowStockThreshold" id="product-low-stock" type="number" min="0" step="${startingDef.fractional ? '0.001' : '1'}" required value="${product?.lowStockThreshold ?? 5}"></label><p class="unit-hint full" id="unit-hint">${unitHintText(startingDef)}</p></div><div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Cancel</button><button class="primary-button">${product ? 'Save Changes' : 'Add Product'}</button></div></form>`);
+  // Cost price is now visible/editable by all users, same as the rest of
+  // Inventory (client decision: full inventory access for Regular Users).
+  const costField = `<label>Cost price (what you paid)<input name="costPrice" id="product-cost" type="number" min="0" step="0.01" value="${product?.costPrice ?? ''}" placeholder="0.00"></label>`;
+  const profitHint = `<p class="unit-hint full" id="profit-hint">${profitHintText(product?.costPrice, product?.price)}</p>`;
+  openModal(`<div class="modal-header"><div><h2>${title}</h2><p>Enter the product details below.</p></div><button data-close-modal class="icon-button">&times;</button></div><form id="product-form"><div class="form-grid"><label class="full">Product name<input name="name" required maxlength="100" value="${escapeHtml(product?.name || '')}"></label><label>SKU / barcode<input name="sku" maxlength="80" value="${escapeHtml(product?.sku || '')}"></label><label>Category<select name="category" required><option value="">Choose category</option>${categoryOptions}</select></label><label>Unit of measurement<select name="unit" id="product-unit">${unitOptions}</select></label>${costField}<label>Selling price<input name="price" id="product-price" type="number" min="0" step="0.01" required value="${product?.price ?? ''}"></label><label>Stock quantity<input name="stock" id="product-stock" type="number" min="0" step="${quantityStep(startingDef)}" required value="${product?.stock ?? ''}"></label><label>Low-stock level<input name="lowStockThreshold" id="product-low-stock" type="number" min="0" step="${quantityStep(startingDef)}" required value="${product?.lowStockThreshold ?? 5}"></label><p class="unit-hint full" id="unit-hint">${unitHintText(startingDef)}</p>${profitHint}</div><div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Cancel</button><button class="primary-button">${product ? 'Save Changes' : 'Add Product'}</button></div></form>`);
   modalRoot.querySelector('#product-unit').addEventListener('change', (event) => {
     const def = unitDef(event.target.value);
-    modalRoot.querySelector('#product-stock').step = def.fractional ? '0.001' : '1';
-    modalRoot.querySelector('#product-low-stock').step = def.fractional ? '0.001' : '1';
+    modalRoot.querySelector('#product-stock').step = quantityStep(def);
+    modalRoot.querySelector('#product-low-stock').step = quantityStep(def);
     modalRoot.querySelector('#unit-hint').innerHTML = unitHintText(def);
   });
+  {
+    const updateProfitHint = () => {
+      const costPrice = modalRoot.querySelector('#product-cost').value;
+      const price = modalRoot.querySelector('#product-price').value;
+      const hint = modalRoot.querySelector('#profit-hint');
+      if (hint) hint.innerHTML = profitHintText(costPrice, price);
+    };
+    modalRoot.querySelector('#product-cost').addEventListener('input', updateProfitHint);
+    modalRoot.querySelector('#product-price').addEventListener('input', updateProfitHint);
+  }
   modalRoot.querySelector('#product-form').addEventListener('submit', async (event) => { event.preventDefault(); const form = new FormData(event.currentTarget); const input = Object.fromEntries(form.entries()); try { if (product) await window.kjStore.updateProduct(product.id, input); else await window.kjStore.createProduct(input); await refreshData(); closeModal(); renderInventory(); notify(product ? 'Product updated.' : 'Product added to inventory.'); } catch (error) { showError(error); } });
+}
+// Live "you paid X, you sell for Y" profit preview shown to Super Admins while
+// editing a product. Renders a neutral hint until both prices are entered.
+function profitHintText(costPrice, price) {
+  const cost = Number(costPrice); const sell = Number(price);
+  if (!Number.isFinite(cost) || !Number.isFinite(sell) || costPrice === '' || costPrice === undefined || price === '' || price === undefined) {
+    return 'Enter both cost price and selling price to see the profit per unit.';
+  }
+  const profit = sell - cost;
+  const margin = sell > 0 ? Math.round((profit / sell) * 1000) / 10 : null;
+  const verdict = profit > 0 ? 'profit' : profit < 0 ? 'loss' : 'break-even';
+  return `Profit per unit: <strong>${formatMoney(Math.abs(profit))} ${verdict}</strong>${margin !== null ? ` (${margin}% margin)` : ''}`;
 }
 function unitHintText(def) {
   if (!def.fractional) return `Stocked and sold by the whole ${def.label.toLowerCase()}.`;
+  if (def.value === 'load') return `Stocked and sold by the dump-truck load. Enter <strong>0.5</strong> for a half load, <strong>0.25</strong> for a quarter load, or <strong>1</strong> for a full load.`;
   return `Stocked and sold in ${def.label.toLowerCase()}. Buying in bulk (e.g. a 50kg sack)? Add its total in ${def.shortLabel} \u2014 for a 50kg sack, enter <strong>50</strong>.`;
 }
 function confirmArchive(productId) { const product = activeProducts().find((item) => item.id === productId); openModal(`<div class="modal-header"><div><h2>Archive product?</h2><p>${escapeHtml(product.name)} will no longer be available to sell. Historical sales remain intact.</p></div><button data-close-modal class="icon-button">&times;</button></div><div class="modal-actions"><button data-close-modal class="secondary-button">Cancel</button><button id="confirm-archive" class="danger-button">Archive Product</button></div>`); modalRoot.querySelector('#confirm-archive').addEventListener('click', async () => { try { await window.kjStore.archiveProduct(productId); await refreshData(); closeModal(); renderInventory(); notify('Product archived.'); } catch (error) { showError(error); } }); }
-async function openSaleDetail(id) { try { const sale = await window.kjStore.getSale(id); openModal(`<div class="modal-header"><div><p class="eyebrow">TRANSACTION</p><h2>${escapeHtml(sale.id)} ${sale.status === 'Voided' ? '<span class="badge danger">Voided</span>' : ''}</h2><p>${dateTime.format(new Date(sale.createdAt))} &middot; Processed By: ${sale.userId ? escapeHtml(userName(sale.userId)) : 'Unknown user'}</p></div><button data-close-modal class="icon-button">&times;</button></div>${sale.status === 'Voided' ? `<div class="void-notice"><strong>Voided</strong> ${dateTime.format(new Date(sale.voidedAt))} by ${escapeHtml(userName(sale.voidedBy))}<br>Reason: ${escapeHtml(sale.voidReason)}</div>` : ''}<div class="receipt-items">${sale.items.map((item) => { const def = unitDef(item.unit); return `<div><div><strong>${escapeHtml(item.productName)}</strong><small>${formatQuantity(item.quantity, def.fractional)} ${unitShortLabel(item.unit, item.quantity)} &times; ${formatMoney(item.unitPrice)}</small></div><strong>${formatMoney(item.subtotal)}</strong></div>`; }).join('')}</div><div class="receipt-total"><span>Total (${sale.itemCount} items)</span><strong>${formatMoney(sale.total)}</strong></div><div class="modal-actions"><button data-close-modal class="secondary-button">Close</button></div>`); } catch (error) { showError(error); } }
+async function openSaleDetail(id) { try { const sale = await window.kjStore.getSale(id); const subtotal = sale.subtotal ?? sale.total; const discount = sale.discount ?? 0; openModal(`<div class="modal-header"><div><p class="eyebrow">TRANSACTION</p><h2>${escapeHtml(sale.id)} ${sale.status === 'Voided' ? '<span class="badge danger">Voided</span>' : ''}</h2><p>${dateTime.format(new Date(sale.createdAt))} &middot; Processed By: ${sale.userId ? escapeHtml(userName(sale.userId)) : 'Unknown user'}</p></div><button data-close-modal class="icon-button">&times;</button></div>${sale.status === 'Voided' ? `<div class="void-notice"><strong>Voided</strong> ${dateTime.format(new Date(sale.voidedAt))} by ${escapeHtml(userName(sale.voidedBy))}<br>Reason: ${escapeHtml(sale.voidReason)}</div>` : ''}<div class="receipt-items">${sale.items.map((item) => { const def = unitDef(item.unit); return `<div><div><strong>${escapeHtml(item.productName)}</strong><small>${formatQuantity(item.quantity, def.fractional)} ${unitShortLabel(item.unit, item.quantity)} &times; ${formatMoney(item.unitPrice)}</small></div><strong>${formatMoney(item.subtotal)}</strong></div>`; }).join('')}</div><div class="receipt-subline"><span>Subtotal (${sale.itemCount} items)</span><strong>${formatMoney(subtotal)}</strong></div><div class="receipt-subline"><span>Discount</span><strong>${discount ? `-${formatMoney(discount)}` : formatMoney(0)}</strong></div><div class="receipt-total"><span>Total</span><strong>${formatMoney(sale.total)}</strong></div><div class="modal-actions"><button data-close-modal class="secondary-button">Close</button></div>`); } catch (error) { showError(error); } }
 
 // ---- Authentication ----
 
@@ -574,6 +702,71 @@ async function renderUsersTable() {
     table.querySelectorAll('[data-edit-user]').forEach((button) => button.addEventListener('click', () => openUserModal(state.users.find((user) => user.id === button.dataset.editUser))));
     table.querySelectorAll('[data-toggle-user]').forEach((button) => button.addEventListener('click', () => toggleUserActive(button.dataset.toggleUser)));
     bindPagination(table, pageState, renderUsersTable);
+  } catch (error) { table.innerHTML = errorView(error); }
+}
+
+// ---- Audit Log (Super Admin only) ----
+// Read-only trail of sensitive actions (price/cost changes, manual stock
+// adjustments, sales, voids, discounts, user/role changes) so a Super Admin
+// can spot the "lowered a price, rang up a sale, restored the price" pattern
+// or any other manipulation after the fact.
+const AUDIT_ACTION_LABELS = {
+  'Selling price changed': 'danger',
+  'Cost price changed': 'danger',
+  'Inventory manually adjusted': 'danger',
+  'Product archived': 'danger',
+  'Sale voided': 'danger',
+  'User role changed': 'danger',
+  'Discount applied': 'success',
+  'Sale completed': 'success',
+  'User created': 'success',
+  'User account modified': 'success'
+};
+function auditValueDisplay(entry) {
+  if (entry.field === 'price' || entry.field === 'costPrice' || entry.field === 'stock') {
+    const isMoney = entry.field !== 'stock';
+    const fmt = (v) => v === null || v === undefined ? '\u2014' : (isMoney ? formatMoney(v) : v);
+    return `${fmt(entry.before)} &rarr; ${fmt(entry.after)}`;
+  }
+  if (entry.field === 'discount' || entry.field === 'total') return formatMoney(entry.after);
+  if (entry.before === null || entry.before === undefined) return escapeHtml(String(entry.after ?? '\u2014'));
+  return `${escapeHtml(String(entry.before))} &rarr; ${escapeHtml(String(entry.after))}`;
+}
+async function renderAuditLog() {
+  app.innerHTML = `${pageHeader('SECURITY', 'Audit Log', 'A record of price, inventory, sales, and account changes across the system.')}
+    <section class="panel discount-policy-panel">
+      <div>
+        <h3>Regular User discount limit</h3>
+        <p>The maximum discount a Regular User (Cashier) can apply to a sale, as a percentage of the subtotal. Super Admins are never limited.</p>
+      </div>
+      <form id="discount-policy-form"><label>Max discount %<input id="discount-policy-input" type="number" min="0" max="100" step="1" value=""></label><button class="primary-button" type="submit">Save</button></form>
+    </section>
+    <section class="panel"><div id="audit-table" class="loading">Loading audit log...</div></section>`;
+
+  try {
+    const settings = await window.kjStore.getSettings();
+    app.querySelector('#discount-policy-input').value = settings.maxRegularUserDiscountPercent ?? 20;
+  } catch (error) { showError(error); }
+  app.querySelector('#discount-policy-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const value = Number(app.querySelector('#discount-policy-input').value);
+    try {
+      await window.kjStore.updateSettings({ maxRegularUserDiscountPercent: value });
+      notify('Discount limit updated.');
+    } catch (error) { showError(error); }
+  });
+
+  await renderAuditTable();
+}
+async function renderAuditTable() {
+  const table = app.querySelector('#audit-table');
+  try {
+    const entries = await window.kjStore.getAuditLog();
+    if (!entries.length) { table.innerHTML = emptyState('No activity yet', 'Sensitive actions (price changes, sales, voids, account changes) will show up here.'); return; }
+    const pageState = state.auditPagination;
+    const rows = paginate(entries, pageState);
+    table.innerHTML = `<div class="data-table-wrap"><table><thead><tr><th>Date & time</th><th>User</th><th>Action</th><th>Affected record</th><th>Change</th></tr></thead><tbody>${rows.map((entry) => `<tr><td>${dateTime.format(new Date(entry.at))}</td><td>${entry.userId ? escapeHtml(userName(entry.userId)) : '&mdash;'}</td><td><span class="badge ${AUDIT_ACTION_LABELS[entry.action] || 'success'}">${escapeHtml(entry.action)}</span></td><td>${escapeHtml(entry.target || '\u2014')}</td><td>${auditValueDisplay(entry)}${entry.note ? `<br><small>${escapeHtml(entry.note)}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>${paginationMarkup(pageState, entries.length, 'entries')}`;
+    bindPagination(table, pageState, renderAuditTable);
   } catch (error) { table.innerHTML = errorView(error); }
 }
 function openUserModal(user = null) {
