@@ -1,0 +1,25 @@
+directories:
+  output: dist
+  buildResources: build
+appId: com.kjstore.app
+productName: KJ STORE
+files:
+  - filter:
+      - src/**/*
+      - build/icon.png
+      - package.json
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+electronVersion: 39.8.10
