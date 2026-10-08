@@ -500,8 +500,10 @@ function openVoidSaleModal(saleId) {
 // physical thermal printer.
 function openReceiptPreviewModal(saleId) {
   let currentWidth = state.receiptPaperWidth || '80mm';
-  openModal(`<div class="modal-header"><div><p class="eyebrow">RECEIPT PREVIEW</p><h2>${escapeHtml(saleId)}</h2><p>Choose a paper width, then print using any installed Windows printer.</p></div><button data-close-modal class="icon-button">&times;</button></div>
+  openModal(`<div class="modal-header"><div><p class="eyebrow">RECEIPT PREVIEW</p><h2>${escapeHtml(saleId)}</h2><p>Choose a paper width and printer, then print.</p></div><button data-close-modal class="icon-button">&times;</button></div>
     <div class="receipt-preview-toolbar"><div class="paper-toggle" role="group" aria-label="Receipt paper width"><button type="button" class="paper-toggle-btn" data-paper-width="58mm">58mm</button><button type="button" class="paper-toggle-btn" data-paper-width="80mm">80mm</button></div></div>
+    <div class="receipt-printer-row"><label for="receipt-printer-select">Printer</label><select id="receipt-printer-select" disabled><option>Detecting printers...</option></select></div>
+    <div class="receipt-layout-row"><span>Margins (lines)</span><label>Top<input type="number" min="0" max="10" step="1" data-layout="receiptTopMarginLines"></label><label>Bottom<input type="number" min="0" max="20" step="1" data-layout="receiptBottomMarginLines"></label><label>Left (chars)<input type="number" min="0" max="6" step="1" data-layout="receiptLeftMarginChars"></label><label>Min length<input type="number" min="0" max="80" step="1" data-layout="receiptMinLines"></label></div>
     <div class="receipt-preview-frame-wrap"><iframe id="receipt-preview-frame" class="receipt-preview-frame" title="Receipt preview" sandbox="allow-same-origin"></iframe></div>
     <div id="receipt-preview-error"></div>
     <div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Close</button><button id="receipt-print-button" class="primary-button">Print</button></div>`);
@@ -509,6 +511,38 @@ function openReceiptPreviewModal(saleId) {
   const frame = modalRoot.querySelector('#receipt-preview-frame');
   const errorBox = modalRoot.querySelector('#receipt-preview-error');
   const printButton = modalRoot.querySelector('#receipt-print-button');
+  const printerSelect = modalRoot.querySelector('#receipt-printer-select');
+  const SYSTEM_DIALOG = '__system-dialog__';
+
+  // Detects installed Windows printers and pre-selects the saved one, or a
+  // thermal-looking (e.g. POS-58) printer, or the Windows default.
+  async function loadPrinters() {
+    try {
+      const { printers, selected } = await window.kjStore.listPrinters();
+      const options = printers.map((printer) => `<option value="${escapeHtml(printer.name)}">${escapeHtml(printer.displayName)}${printer.isDefault ? ' (default)' : ''}${printer.looksThermal ? ' \u2014 thermal' : ''}</option>`);
+      options.push(`<option value="${SYSTEM_DIALOG}">Choose in Windows print dialog...</option>`);
+      printerSelect.innerHTML = options.join('');
+      printerSelect.value = [...printerSelect.options].some((option) => option.value === selected) ? selected : (printers[0]?.name || SYSTEM_DIALOG);
+      printerSelect.disabled = false;
+      if (!printers.length) errorBox.innerHTML = '<p class="form-error">No printers were found. Install your thermal printer in Windows, then reopen this window.</p>';
+    } catch (error) {
+      printerSelect.innerHTML = `<option value="${SYSTEM_DIALOG}">Choose in Windows print dialog...</option>`;
+      printerSelect.disabled = false;
+      errorBox.innerHTML = `<p class="form-error">${escapeHtml(error?.message || 'Could not detect printers.')}</p>`;
+    }
+  }
+  // Receipt margins / minimum length: saved as defaults and re-rendered in the
+  // preview as soon as a value changes.
+  window.kjStore.getSettings().then((settings) => {
+    modalRoot.querySelectorAll('[data-layout]').forEach((input) => { input.value = settings[input.dataset.layout] ?? ''; });
+  }).catch(() => {});
+  modalRoot.querySelectorAll('[data-layout]').forEach((input) => input.addEventListener('change', async () => {
+    try {
+      await window.kjStore.updateSettings({ [input.dataset.layout]: Number(input.value) });
+      loadPreview();
+    } catch (error) { showError(error); window.kjStore.getSettings().then((settings) => { input.value = settings[input.dataset.layout] ?? ''; }).catch(() => {}); }
+  }));
+  printerSelect.addEventListener('change', () => { window.kjStore.updateSettings({ receiptPrinterName: printerSelect.value }).catch(() => {}); });
 
   function setActiveToggle() {
     modalRoot.querySelectorAll('[data-paper-width]').forEach((btn) => btn.classList.toggle('active', btn.dataset.paperWidth === currentWidth));
@@ -529,7 +563,7 @@ function openReceiptPreviewModal(saleId) {
   // scrolls inside the preview rather than pushing the modal off-screen.
   frame.addEventListener('load', () => {
     try {
-      const contentHeight = frame.contentDocument.documentElement.scrollHeight;
+      const contentHeight = Math.ceil(frame.contentDocument.body.getBoundingClientRect().height);
       frame.style.height = `${Math.min(contentHeight + 4, Math.round(window.innerHeight * 0.6))}px`;
     } catch { /* preview still shows even if auto-height can't be measured */ }
   });
@@ -547,12 +581,16 @@ function openReceiptPreviewModal(saleId) {
     const originalLabel = printButton.textContent;
     printButton.textContent = 'Printing...';
     try {
-      const result = await window.kjStore.printReceipt(saleId, currentWidth);
-      if (result.printed) { notify('Receipt sent to the printer.'); closeModal(); return; }
-      if (!result.cancelled) notify(`Could not print the receipt${result.reason ? ` (${result.reason})` : ''}.`, 'error');
+      const result = await window.kjStore.printReceipt(saleId, currentWidth, printerSelect.value);
+      if (result.printed) { notify(result.printer ? `Receipt sent to ${result.printer}.` : 'Receipt sent to the printer.'); closeModal(); return; }
+      if (!result.cancelled) {
+        errorBox.innerHTML = `<p class="form-error">${escapeHtml(result.reason || 'The receipt could not be printed.')}</p>`;
+        notify('Could not print the receipt.', 'error');
+      }
     } catch (error) { showError(error); } finally { printButton.disabled = false; printButton.textContent = originalLabel; }
   });
 
+  loadPrinters();
   loadPreview();
 }
 // History's "Print Receipt" action and the post-sale prompt both funnel

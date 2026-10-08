@@ -46,6 +46,16 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+// Receipt margins/length, in text lines (a text-only thermal driver ignores
+// CSS padding, but always honours blank lines).
+const RECEIPT_LAYOUT_DEFAULTS = { receiptTopMarginLines: 1, receiptBottomMarginLines: 5, receiptLeftMarginChars: 0, receiptMinLines: 20 };
+const RECEIPT_LAYOUT_LIMITS = {
+  receiptTopMarginLines: [0, 10, 'Top margin'],
+  receiptBottomMarginLines: [0, 20, 'Bottom margin'],
+  receiptLeftMarginChars: [0, 6, 'Left margin'],
+  receiptMinLines: [0, 80, 'Minimum receipt length']
+};
+
 function emptyDatabase() {
   return { version: 2, users: [], products: [], sales: [], session: null, settings: { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }, auditLog: [] };
 }
@@ -1007,7 +1017,7 @@ function migrate(data) {
 
   function getSettings() {
     const data = read();
-    return clone(data.settings || { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 });
+    return { ...RECEIPT_LAYOUT_DEFAULTS, ...clone(data.settings || { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }) };
   }
 
   function updateSettings(input = {}) {
@@ -1016,6 +1026,17 @@ function migrate(data) {
     if (input.receiptPaperWidth !== undefined) {
       if (!RECEIPT_PAPER_WIDTHS.includes(input.receiptPaperWidth)) throw new StoreError('Paper width must be 58mm or 80mm.');
       data.settings.receiptPaperWidth = input.receiptPaperWidth;
+    }
+    for (const [key, [min, max, label]] of Object.entries(RECEIPT_LAYOUT_LIMITS)) {
+      if (input[key] === undefined) continue;
+      const value = Number(input[key]);
+      if (!Number.isInteger(value) || value < min || value > max) throw new StoreError(`${label} must be a whole number from ${min} to ${max}.`);
+      data.settings[key] = value;
+    }
+    if (input.receiptPrinterName !== undefined) {
+      const name = String(input.receiptPrinterName ?? '').trim();
+      if (name.length > 200) throw new StoreError('Printer name is too long.');
+      data.settings.receiptPrinterName = name;
     }
     if (input.maxRegularUserDiscountPercent !== undefined) {
       const cap = Number(input.maxRegularUserDiscountPercent);

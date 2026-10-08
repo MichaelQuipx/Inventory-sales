@@ -587,7 +587,7 @@ test('a discounted sale reports its final (discounted) total in dashboard and sa
 test('receipt paper width defaults to 80mm and can be saved as the default setting', () => {
   const { store, folder } = authenticatedStore();
   try {
-    assert.deepEqual(store.getSettings(), { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 });
+    assert.deepEqual(store.getSettings(), { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20, receiptTopMarginLines: 1, receiptBottomMarginLines: 5, receiptLeftMarginChars: 0, receiptMinLines: 20 });
     const updated = store.updateSettings({ receiptPaperWidth: '58mm' });
     assert.equal(updated.receiptPaperWidth, '58mm');
     // Persists across reads, like the rest of the database.
@@ -732,5 +732,25 @@ test('a sale always uses the product\'s current authoritative price, never a pri
     store.updateProduct(rice.id, { name: 'Jasmine Rice', category: 'Rice', price: 50, costPrice: 80, stock: 48, lowStockThreshold: 5 }, admin.id);
     assert.equal(store.getSale(sale.id).items[0].unitPrice, 100);
     assert.equal(store.getSale(sale.id).total, 200);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('the preferred receipt printer name can be saved as a setting', () => {
+  const { store, folder } = authenticatedStore();
+  try {
+    assert.equal(store.updateSettings({ receiptPrinterName: '  POS-58  ' }).receiptPrinterName, 'POS-58');
+    assert.equal(store.getSettings().receiptPrinterName, 'POS-58');
+    assert.throws(() => store.updateSettings({ receiptPrinterName: 'x'.repeat(201) }), /too long/);
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('receipt margins and minimum length are saved as settings, within limits', () => {
+  const { store, folder } = authenticatedStore();
+  try {
+    const saved = store.updateSettings({ receiptTopMarginLines: 2, receiptBottomMarginLines: 8, receiptMinLines: 30 });
+    assert.equal(saved.receiptBottomMarginLines, 8);
+    assert.equal(store.getSettings().receiptMinLines, 30);
+    assert.throws(() => store.updateSettings({ receiptBottomMarginLines: 99 }), /Bottom margin must be a whole number/);
+    assert.throws(() => store.updateSettings({ receiptTopMarginLines: -1 }), /Top margin/);
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });

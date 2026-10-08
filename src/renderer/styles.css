@@ -1586,4 +1586,5 @@ body.unauthenticated main {
   font-size: 11px;
   margin: -4px 0 8px;
   text-align: right;
-}
+}.receipt-printer-row { align-items: center; display: flex; gap: 10px; justify-content: center; margin-bottom: 14px; }.receipt-printer-row label { color: #55647d; font-size: 12px; font-weight: 700; }.receipt-printer-row select { max-width: 320px; min-width: 200px; }
+.receipt-layout-row { align-items: center; color: #55647d; display: flex; flex-wrap: wrap; font-size: 12px; gap: 10px 14px; justify-content: center; margin-bottom: 14px; }.receipt-layout-row > span { font-weight: 700; }.receipt-layout-row label { align-items: center; display: flex; gap: 6px; }.receipt-layout-row input { padding: 5px 6px; text-align: center; width: 54px; }

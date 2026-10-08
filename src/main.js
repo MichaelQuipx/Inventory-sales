@@ -4,6 +4,7 @@ const path = require('path');
 const { createStore, StoreError } = require('./store');
 const { toCsv, toSectionedCsv } = require('./csv');
 const { buildReceiptHtml } = require('./receipt');
+const { looksLikeThermalPrinter, pickPrinter } = require('./printers');
 
 let store;
 let mainWindow;
@@ -153,35 +154,115 @@ function buildReceiptPreview(saleId, paperWidth) {
   const sale = store.getSale(saleId);
   if (!sale) throw new StoreError('That transaction could not be found.');
   const width = store.RECEIPT_PAPER_WIDTHS.includes(paperWidth) ? paperWidth : store.getSettings().receiptPaperWidth;
-  return buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId) });
+  return buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId), layout: receiptLayout(store.getSettings()) });
 }
 
-// Electron flow: sale ID -> look up sale/items -> build receipt HTML -> load
-// it into a hidden, throwaway BrowserWindow -> wait for load -> trigger the
-// OS's native print dialog -> close the window once printing is done.
-async function printSaleReceipt(saleId, paperWidth) {
+// ---- Receipt printing ----
+//
+// Root cause of the old "Printing..." hang: the receipt was sent through a
+// hidden window with silent:false. That asks Windows to show its print dialog
+// on behalf of a window nobody can see, so the dialog never appeared, Electron
+// never invoked the print callback, and the promise (and the button) waited
+// forever. Now we (1) detect installed printers, (2) print silently straight to
+// the chosen one, (3) always time out, and (4) report a real error message.
+// Per-install print preferences any signed-in user may change.
+const HARMLESS_SETTINGS = ['receiptPaperWidth', 'receiptPrinterName', 'receiptTopMarginLines', 'receiptBottomMarginLines', 'receiptLeftMarginChars', 'receiptMinLines'];
+function receiptLayout(settings) {
+  return { topMarginLines: settings.receiptTopMarginLines, bottomMarginLines: settings.receiptBottomMarginLines, leftMarginChars: settings.receiptLeftMarginChars, minLines: settings.receiptMinLines };
+}
+const PRINT_TIMEOUT_MS = 30000;
+const DIALOG_PRINT_TIMEOUT_MS = 180000;
+const PRINT_DIALOG_CHOICE = '__system-dialog__';
+const MICRONS_PER_PIXEL = 264.5833; // CSS px at 96dpi
+const PRINT_FAILURE_MESSAGES = {
+  cancelled: 'Printing was cancelled.',
+  failed: 'The printer rejected the job. Check that it is powered on, has paper, and is not paused or offline in Windows.',
+  'invalid printer settings': 'Windows reported invalid printer settings for this printer.'
+};
+
+async function listPrinters() {
+  const printers = await mainWindow.webContents.getPrintersAsync();
+  return printers.map((printer) => ({
+    name: printer.name,
+    displayName: printer.displayName || printer.name,
+    isDefault: Boolean(printer.isDefault),
+    looksThermal: looksLikeThermalPrinter(printer)
+  }));
+}
+
+async function getPrinterChoices() {
+  const printers = await listPrinters();
+  const saved = store.getSettings().receiptPrinterName;
+  const selected = saved === PRINT_DIALOG_CHOICE ? null : pickPrinter(printers, saved);
+  return { printers, selected: saved === PRINT_DIALOG_CHOICE ? PRINT_DIALOG_CHOICE : (selected ? selected.name : '') };
+}
+
+function sendToPrinter(webContents, options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new StoreError('The printer did not respond. Make sure it is turned on, connected, and not offline, then try again.')), timeoutMs);
+    try {
+      webContents.print(options, (success, failureType) => {
+        clearTimeout(timer);
+        resolve({ success, failureType });
+      });
+    } catch (error) { clearTimeout(timer); reject(error); }
+  });
+}
+
+async function printSaleReceipt(saleId, paperWidth, printerChoice) {
   if (!saleId || typeof saleId !== 'string') throw new StoreError('A valid sale is required to print a receipt.');
   if (printInProgress) throw new StoreError('A receipt is already printing. Please wait for it to finish.');
   const sale = store.getSale(saleId);
   if (!sale) throw new StoreError('That transaction could not be found.');
   const width = store.RECEIPT_PAPER_WIDTHS.includes(paperWidth) ? paperWidth : store.getSettings().receiptPaperWidth;
+  const widthMm = width === '58mm' ? 58 : 80;
+
+  const useDialog = printerChoice === PRINT_DIALOG_CHOICE;
+  let printerName = null;
+  if (!useDialog) {
+    const printers = await listPrinters();
+    if (!printers.length) throw new StoreError('No printers were found on this computer. Install the thermal printer in Windows (Settings > Printers & scanners) and try again.');
+    const chosen = pickPrinter(printers, printerChoice);
+    // A saved name that no longer exists (printer removed/renamed) falls back
+    // to auto-detection instead of failing the sale receipt.
+    printerName = chosen.name;
+  }
 
   printInProgress = true;
   let printWindow;
   try {
-    const html = buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId) });
+    const html = buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId), layout: receiptLayout(store.getSettings()) });
     printWindow = new BrowserWindow({
       show: false,
-      parent: mainWindow,
+      width: Math.ceil(widthMm * 3.78) + 60,
+      height: 800,
       webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false }
     });
     await printWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-    const result = await new Promise((resolve) => {
-      printWindow.webContents.print({ silent: false, printBackground: true }, (success, failureErrorType) => {
-        resolve({ printed: success, cancelled: !success && failureErrorType === 'cancelled', reason: success ? null : failureErrorType });
-      });
-    });
-    return result;
+
+    if (useDialog) {
+      const result = await sendToPrinter(printWindow.webContents, { silent: false, printBackground: true }, DIALOG_PRINT_TIMEOUT_MS);
+      return { printed: result.success, cancelled: !result.success && result.failureType === 'cancelled', reason: result.success ? null : (PRINT_FAILURE_MESSAGES[result.failureType] || result.failureType), printer: null };
+    }
+
+    // Exact receipt length (instead of a fixed page) so the thermal printer
+    // feeds just the receipt, not a metre of blank paper.
+    const contentHeightPx = await printWindow.webContents.executeJavaScript('Math.ceil(document.body.getBoundingClientRect().height)');
+    const heightMicrons = Math.max(30000, Math.round(contentHeightPx * MICRONS_PER_PIXEL) + 2000);
+    const baseOptions = { silent: true, deviceName: printerName, printBackground: true, margins: { marginType: 'none' } };
+
+    let result = await sendToPrinter(printWindow.webContents, { ...baseOptions, pageSize: { width: widthMm * 1000, height: heightMicrons } }, PRINT_TIMEOUT_MS);
+    if (!result.success && result.failureType !== 'cancelled') {
+      // Some thermal drivers refuse a custom paper size; retry using the
+      // driver's own default paper (the receipt CSS is already 58/80mm wide).
+      result = await sendToPrinter(printWindow.webContents, baseOptions, PRINT_TIMEOUT_MS);
+    }
+    return {
+      printed: result.success,
+      cancelled: !result.success && result.failureType === 'cancelled',
+      reason: result.success ? null : (PRINT_FAILURE_MESSAGES[result.failureType] || result.failureType || 'Unknown printer error.'),
+      printer: printerName
+    };
   } finally {
     if (printWindow && !printWindow.isDestroyed()) printWindow.close();
     printInProgress = false;
@@ -219,20 +300,21 @@ function registerStoreHandlers() {
   handle('sale:complete', (items, discount) => { const user = requireAuth(); return store.completeSale(items, user.id, discount); });
   handle('sale:list', (filters) => { requireAuth(); return store.listSales(filters); });
   handle('sale:get', (id) => { requireAuth(); return store.getSale(id); });
-  handle('sale:print-receipt', (saleId, paperWidth) => { requireAuth(); return printSaleReceipt(saleId, paperWidth); });
+  handle('sale:print-receipt', (saleId, paperWidth, printerChoice) => { requireAuth(); return printSaleReceipt(saleId, paperWidth, printerChoice); });
+  handle('printers:list', () => { requireAuth(); return getPrinterChoices(); });
   handle('sale:receipt-preview', (saleId, paperWidth) => { requireAuth(); return buildReceiptPreview(saleId, paperWidth); });
   handle('sale:void', (saleId, reason) => { const user = requireRole('super-admin'); return store.voidSale(saleId, user.id, reason); });
   handle('archive:summary', () => { requireRole('super-admin'); return store.archiveSummary(); });
   handle('archive:run', (cutoffDate) => { requireRole('super-admin'); return store.archiveSalesBefore(cutoffDate); });
   handle('dashboard:get', (period) => { const user = requireRole('super-admin'); return stripDashboardProfit(store.dashboard(period), user.role); });
   handle('settings:get', () => { requireAuth(); return store.getSettings(); });
-  // receiptPaperWidth is a harmless per-install preference, open to any
+  // receiptPaperWidth / receiptPrinterName are harmless per-install preferences, open to any
   // signed-in user. Anything else in settings (e.g. the discount cap) is
   // security-relevant, so it's locked to Super Admin -- otherwise a Regular
   // User could simply raise their own discount ceiling.
   handle('settings:update', (input) => {
     const user = requireAuth();
-    const sensitiveKeys = Object.keys(input || {}).filter((key) => key !== 'receiptPaperWidth');
+    const sensitiveKeys = Object.keys(input || {}).filter((key) => !HARMLESS_SETTINGS.includes(key));
     if (sensitiveKeys.length && user.role !== 'super-admin') throw new StoreError('You do not have permission to change that setting.');
     return store.updateSettings(input);
   });
