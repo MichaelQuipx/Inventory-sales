@@ -584,15 +584,13 @@ test('a discounted sale reports its final (discounted) total in dashboard and sa
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });
 
-test('receipt paper width defaults to 80mm and can be saved as the default setting', () => {
+test('receipt settings default sensibly; paper width is no longer a setting', () => {
   const { store, folder } = authenticatedStore();
   try {
-    assert.deepEqual(store.getSettings(), { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20, receiptTopMarginLines: 1, receiptBottomMarginLines: 5, receiptLeftMarginChars: 0, receiptMinLines: 20 });
-    const updated = store.updateSettings({ receiptPaperWidth: '58mm' });
-    assert.equal(updated.receiptPaperWidth, '58mm');
-    // Persists across reads, like the rest of the database.
-    assert.equal(store.getSettings().receiptPaperWidth, '58mm');
-    assert.throws(() => store.updateSettings({ receiptPaperWidth: '110mm' }), /Paper width must be 58mm or 80mm/);
+    assert.deepEqual(store.getSettings(), { maxRegularUserDiscountPercent: 20, receiptTopMarginLines: 1, receiptBottomMarginLines: 5, receiptLeftMarginChars: 0, receiptMinLines: 20 });
+    // An old client sending the removed setting is simply ignored.
+    assert.equal('receiptPaperWidth' in store.updateSettings({ receiptPaperWidth: '80mm' }), false);
+    assert.equal('receiptPaperWidth' in store.getSettings(), false);
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });
 

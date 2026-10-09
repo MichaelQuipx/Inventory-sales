@@ -57,7 +57,7 @@ const RECEIPT_LAYOUT_LIMITS = {
 };
 
 function emptyDatabase() {
-  return { version: 2, users: [], products: [], sales: [], session: null, settings: { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }, auditLog: [] };
+  return { version: 2, users: [], products: [], sales: [], session: null, settings: { maxRegularUserDiscountPercent: 20 }, auditLog: [] };
 }
 
 // Keeps a rolling history of sensitive actions (price/cost changes, manual
@@ -263,9 +263,7 @@ function createStore(databasePath) {
     return { archivedCount: toArchive.length, years: [...byYear.keys()].sort((a, b) => a - b), remaining: data.sales.length };
   }
 
-  const RECEIPT_PAPER_WIDTHS = ['58mm', '80mm'];
-
-function migrate(data) {
+  function migrate(data) {
     let changed = false;
     if (!Array.isArray(data.users)) { data.users = []; changed = true; }
     if (data.users.length === 0) { data.users.push(defaultSuperAdmin()); changed = true; }
@@ -276,9 +274,10 @@ function migrate(data) {
         if (typeof product.costPrice !== 'number') { product.costPrice = 0; changed = true; }
       }
     }
-    if (!data.settings || typeof data.settings !== 'object') { data.settings = { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }; changed = true; }
+    if (!data.settings || typeof data.settings !== 'object') { data.settings = { maxRegularUserDiscountPercent: 20 }; changed = true; }
     else {
-      if (!RECEIPT_PAPER_WIDTHS.includes(data.settings.receiptPaperWidth)) { data.settings.receiptPaperWidth = '80mm'; changed = true; }
+      // Paper width is no longer a setting (58mm is the only supported size).
+      if ('receiptPaperWidth' in data.settings) { delete data.settings.receiptPaperWidth; changed = true; }
       const cap = data.settings.maxRegularUserDiscountPercent;
       if (typeof cap !== 'number' || !Number.isFinite(cap) || cap < 0 || cap > 100) { data.settings.maxRegularUserDiscountPercent = 20; changed = true; }
     }
@@ -1017,16 +1016,12 @@ function migrate(data) {
 
   function getSettings() {
     const data = read();
-    return { ...RECEIPT_LAYOUT_DEFAULTS, ...clone(data.settings || { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 }) };
+    return { ...RECEIPT_LAYOUT_DEFAULTS, ...clone(data.settings || { maxRegularUserDiscountPercent: 20 }) };
   }
 
   function updateSettings(input = {}) {
     const data = read();
-    if (!data.settings || typeof data.settings !== 'object') data.settings = { receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20 };
-    if (input.receiptPaperWidth !== undefined) {
-      if (!RECEIPT_PAPER_WIDTHS.includes(input.receiptPaperWidth)) throw new StoreError('Paper width must be 58mm or 80mm.');
-      data.settings.receiptPaperWidth = input.receiptPaperWidth;
-    }
+    if (!data.settings || typeof data.settings !== 'object') data.settings = { maxRegularUserDiscountPercent: 20 };
     for (const [key, [min, max, label]] of Object.entries(RECEIPT_LAYOUT_LIMITS)) {
       if (input[key] === undefined) continue;
       const value = Number(input[key]);
@@ -1056,7 +1051,6 @@ function migrate(data) {
   return {
     CATEGORIES,
     UNITS,
-    RECEIPT_PAPER_WIDTHS,
     initialize,
     getData,
     seedDemoData,

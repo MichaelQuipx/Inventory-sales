@@ -1,17 +1,17 @@
 // Builds the printable thermal receipt for a completed sale.
 //
-// The receipt is a fixed-width TEXT layout (32 columns on 58mm paper, 48 on
-// 80mm), padded with real spaces and limited to plain ASCII. That is
+// The receipt is a fixed-width TEXT layout (32 columns on 58mm paper), padded with real spaces and limited to plain ASCII. That is
 // deliberate: many thermal printers/drivers (e.g. "Generic / Text Only") flatten
 // a page to text, which drops CSS layout (columns, dashed rules, right-aligned
 // amounts) and can't print characters like the peso sign or "x" symbol -- they
 // came out as "?" and "#". A pre-padded ASCII line prints identically on any
 // driver, and the on-screen preview shows exactly the same lines.
 
-const PAPER_WIDTHS = { '58mm': 58, '80mm': 80 };
-const COLUMNS = { 58: 32, 80: 48 };
-// Thermal heads print ~48mm of a 58mm roll and ~72mm of an 80mm roll.
-const PRINTABLE_MM = { 58: 48, 80: 72 };
+// The app supports one paper size: a 58mm thermal roll.
+const PAPER_WIDTH_MM = 58;
+const COLUMNS = 32;
+// Thermal heads print ~48mm of a 58mm roll, so text stays inside that area.
+const PRINTABLE_MM = 48;
 
 const DEFAULT_LAYOUT = { topMarginLines: 1, bottomMarginLines: 5, leftMarginChars: 0, minLines: 20 };
 
@@ -71,9 +71,8 @@ function twoColumn(left, right, width) {
 }
 
 // Returns [{ text, bold }] -- exactly what gets printed and previewed.
-function buildReceiptLines(sale, { paperWidth = '80mm', processedByName = null, layout = {} } = {}) {
-  const widthMm = PAPER_WIDTHS[paperWidth] || PAPER_WIDTHS['80mm'];
-  const cols = COLUMNS[widthMm];
+function buildReceiptLines(sale, { processedByName = null, layout = {} } = {}) {
+  const cols = COLUMNS;
   const rule = '-'.repeat(cols);
   const opts = {
     topMarginLines: clampInt(layout.topMarginLines, 0, 10, DEFAULT_LAYOUT.topMarginLines),
@@ -122,10 +121,10 @@ function buildReceiptLines(sale, { paperWidth = '80mm', processedByName = null, 
   return result;
 }
 
-function buildReceiptHtml(sale, { paperWidth = '80mm', processedByName = null, layout = {} } = {}) {
-  const widthMm = PAPER_WIDTHS[paperWidth] || PAPER_WIDTHS['80mm'];
-  const sidePaddingMm = (widthMm - PRINTABLE_MM[widthMm]) / 2;
-  const rows = buildReceiptLines(sale, { paperWidth, processedByName, layout })
+function buildReceiptHtml(sale, { processedByName = null, layout = {} } = {}) {
+  const widthMm = PAPER_WIDTH_MM;
+  const sidePaddingMm = (widthMm - PRINTABLE_MM) / 2;
+  const rows = buildReceiptLines(sale, { processedByName, layout })
     .map((line) => `<div class="ln${line.bold ? ' b' : ''}">${line.text ? escapeHtml(line.text) : '&nbsp;'}</div>`).join('');
 
   return `<!doctype html>
@@ -138,7 +137,7 @@ function buildReceiptHtml(sale, { paperWidth = '80mm', processedByName = null, l
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #fff; }
   body { width: ${widthMm}mm; padding: 0 ${sidePaddingMm}mm; color: #000; }
-  .ln { font-family: "Consolas", "Lucida Console", "Courier New", monospace; font-size: 10px; line-height: 14px; white-space: pre; }
+  .ln { font-family: "Consolas", "Lucida Console", "Courier New", monospace; font-size: 10px; line-height: 14px; white-space: pre; break-inside: avoid; }
   .b { font-weight: 700; }
 </style>
 </head>
@@ -146,4 +145,4 @@ function buildReceiptHtml(sale, { paperWidth = '80mm', processedByName = null, l
 </html>`;
 }
 
-module.exports = { buildReceiptHtml, buildReceiptLines, DEFAULT_LAYOUT };
+module.exports = { buildReceiptHtml, buildReceiptLines, DEFAULT_LAYOUT, PAPER_WIDTH_MM };

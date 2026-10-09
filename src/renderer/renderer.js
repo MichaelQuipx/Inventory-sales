@@ -2,7 +2,7 @@ const app = document.querySelector('#app');
 const modalRoot = document.querySelector('#modal-root');
 const toastRoot = document.querySelector('#toast-root');
 
-const state = { page: 'dashboard', products: [], sales: [], cart: [], discount: 0, categories: [], units: [], userNames: [], users: [], currentUser: null, receiptPaperWidth: '80mm', maxRegularUserDiscountPercent: 20, dashboardFilter: { type: 'this-week', start: '', end: '', userId: '' }, inventoryPagination: { page: 1, pageSize: 20 }, historyPagination: { page: 1, pageSize: 20 }, usersPagination: { page: 1, pageSize: 20 }, auditPagination: { page: 1, pageSize: 25 } };
+const state = { page: 'dashboard', products: [], sales: [], cart: [], discount: 0, categories: [], units: [], userNames: [], users: [], currentUser: null, maxRegularUserDiscountPercent: 20, dashboardFilter: { type: 'this-week', start: '', end: '', userId: '' }, inventoryPagination: { page: 1, pageSize: 20 }, historyPagination: { page: 1, pageSize: 20 }, usersPagination: { page: 1, pageSize: 20 }, auditPagination: { page: 1, pageSize: 25 } };
 const money = new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' });
 const dateTime = new Intl.DateTimeFormat('en-PH', { dateStyle: 'medium', timeStyle: 'short' });
 
@@ -64,7 +64,6 @@ async function refreshData() {
   state.userNames = await window.kjStore.getUserNames();
   try {
     const settings = await window.kjStore.getSettings();
-    state.receiptPaperWidth = settings.receiptPaperWidth || '80mm';
     state.maxRegularUserDiscountPercent = settings.maxRegularUserDiscountPercent ?? 20;
   } catch { /* keep previous/default values */ }
 }
@@ -492,21 +491,23 @@ function openVoidSaleModal(saleId) {
 //
 // The preview modal renders the exact HTML that would be sent to the printer
 // (fetched from the main process, same buildReceiptHtml() used for printing),
-// inside a sandboxed iframe sized to the chosen paper width, so what's shown
+// inside a sandboxed iframe sized to the 58mm receipt width, so what's shown
 // on screen is a true WYSIWYG match -- no separate preview-only layout to
-// keep in sync. Printing itself always goes through Electron's native
-// print dialog (silent: false in main.js), so any installed Windows printer
-// -- including "Microsoft Print to PDF" -- works for testing without a
-// physical thermal printer.
+// keep in sync. Printing goes to the printer chosen in the dropdown (see
+// printSaleReceipt in main.js).
+//
+// Layout: the modal is a flex column with a capped height. Header, printer
+// selector, and the Close/Print buttons never shrink; only the receipt
+// area in the middle scrolls, so Print stays on screen however long the
+// receipt is.
 function openReceiptPreviewModal(saleId) {
-  let currentWidth = state.receiptPaperWidth || '80mm';
-  openModal(`<div class="modal-header"><div><p class="eyebrow">RECEIPT PREVIEW</p><h2>${escapeHtml(saleId)}</h2><p>Choose a paper width and printer, then print.</p></div><button data-close-modal class="icon-button">&times;</button></div>
-    <div class="receipt-preview-toolbar"><div class="paper-toggle" role="group" aria-label="Receipt paper width"><button type="button" class="paper-toggle-btn" data-paper-width="58mm">58mm</button><button type="button" class="paper-toggle-btn" data-paper-width="80mm">80mm</button></div></div>
-    <div class="receipt-printer-row"><label for="receipt-printer-select">Printer</label><select id="receipt-printer-select" disabled><option>Detecting printers...</option></select></div>
-    <div class="receipt-layout-row"><span>Margins (lines)</span><label>Top<input type="number" min="0" max="10" step="1" data-layout="receiptTopMarginLines"></label><label>Bottom<input type="number" min="0" max="20" step="1" data-layout="receiptBottomMarginLines"></label><label>Left (chars)<input type="number" min="0" max="6" step="1" data-layout="receiptLeftMarginChars"></label><label>Min length<input type="number" min="0" max="80" step="1" data-layout="receiptMinLines"></label></div>
-    <div class="receipt-preview-frame-wrap"><iframe id="receipt-preview-frame" class="receipt-preview-frame" title="Receipt preview" sandbox="allow-same-origin"></iframe></div>
+  openModal(`<div class="modal-header"><div><p class="eyebrow">RECEIPT PREVIEW</p><h2>${escapeHtml(saleId)}</h2></div><button data-close-modal class="icon-button">&times;</button></div>
+    <div class="receipt-preview-controls">
+      <div class="receipt-printer-row"><label for="receipt-printer-select">Printer</label><select id="receipt-printer-select" disabled><option>Detecting printers...</option></select></div>
+    </div>
+    <div class="receipt-preview-frame-wrap"><iframe id="receipt-preview-frame" class="receipt-preview-frame" title="Receipt preview" sandbox="allow-same-origin" scrolling="no"></iframe></div>
     <div id="receipt-preview-error"></div>
-    <div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Close</button><button id="receipt-print-button" class="primary-button">Print</button></div>`);
+    <div class="modal-actions"><button type="button" data-close-modal class="secondary-button">Close</button><button id="receipt-print-button" class="primary-button">Print</button></div>`, 'receipt-modal');
 
   const frame = modalRoot.querySelector('#receipt-preview-frame');
   const errorBox = modalRoot.querySelector('#receipt-preview-error');
@@ -531,57 +532,32 @@ function openReceiptPreviewModal(saleId) {
       errorBox.innerHTML = `<p class="form-error">${escapeHtml(error?.message || 'Could not detect printers.')}</p>`;
     }
   }
-  // Receipt margins / minimum length: saved as defaults and re-rendered in the
-  // preview as soon as a value changes.
-  window.kjStore.getSettings().then((settings) => {
-    modalRoot.querySelectorAll('[data-layout]').forEach((input) => { input.value = settings[input.dataset.layout] ?? ''; });
-  }).catch(() => {});
-  modalRoot.querySelectorAll('[data-layout]').forEach((input) => input.addEventListener('change', async () => {
-    try {
-      await window.kjStore.updateSettings({ [input.dataset.layout]: Number(input.value) });
-      loadPreview();
-    } catch (error) { showError(error); window.kjStore.getSettings().then((settings) => { input.value = settings[input.dataset.layout] ?? ''; }).catch(() => {}); }
-  }));
   printerSelect.addEventListener('change', () => { window.kjStore.updateSettings({ receiptPrinterName: printerSelect.value }).catch(() => {}); });
 
-  function setActiveToggle() {
-    modalRoot.querySelectorAll('[data-paper-width]').forEach((btn) => btn.classList.toggle('active', btn.dataset.paperWidth === currentWidth));
-    frame.style.width = currentWidth === '58mm' ? '219px' : '302px'; // ~mm-to-px at 96dpi, matches the printed @page size
-  }
   async function loadPreview() {
-    setActiveToggle();
     errorBox.innerHTML = '';
     try {
-      const html = await window.kjStore.getReceiptPreview(saleId, currentWidth);
+      const html = await window.kjStore.getReceiptPreview(saleId);
       frame.srcdoc = html;
     } catch (error) {
       errorBox.innerHTML = `<p class="form-error">${escapeHtml(error?.message || 'Could not load the receipt preview.')}</p>`;
     }
   }
-  // Auto-fits the iframe's height to the receipt's actual content (item count
-  // varies per sale) instead of a fixed guess, capped so a long receipt
-  // scrolls inside the preview rather than pushing the modal off-screen.
+  // The iframe is made exactly as tall as the receipt (so it never scrolls
+  // internally); the surrounding .receipt-preview-frame-wrap is what scrolls
+  // when a receipt is longer than the available space.
   frame.addEventListener('load', () => {
-    try {
-      const contentHeight = Math.ceil(frame.contentDocument.body.getBoundingClientRect().height);
-      frame.style.height = `${Math.min(contentHeight + 4, Math.round(window.innerHeight * 0.6))}px`;
-    } catch { /* preview still shows even if auto-height can't be measured */ }
+    try { frame.style.height = `${Math.ceil(frame.contentDocument.body.getBoundingClientRect().height) + 4}px`; }
+    catch { /* preview still shows even if auto-height can't be measured */ }
   });
 
-  modalRoot.querySelectorAll('[data-paper-width]').forEach((button) => button.addEventListener('click', () => {
-    if (button.dataset.paperWidth === currentWidth) return;
-    currentWidth = button.dataset.paperWidth;
-    state.receiptPaperWidth = currentWidth; // remembered as the default for next time
-    window.kjStore.updateSettings({ receiptPaperWidth: currentWidth }).catch(() => {});
-    loadPreview();
-  }));
   printButton.addEventListener('click', async () => {
     if (printButton.disabled) return;
     printButton.disabled = true;
     const originalLabel = printButton.textContent;
     printButton.textContent = 'Printing...';
     try {
-      const result = await window.kjStore.printReceipt(saleId, currentWidth, printerSelect.value);
+      const result = await window.kjStore.printReceipt(saleId, printerSelect.value);
       if (result.printed) { notify(result.printer ? `Receipt sent to ${result.printer}.` : 'Receipt sent to the printer.'); closeModal(); return; }
       if (!result.cancelled) {
         errorBox.innerHTML = `<p class="form-error">${escapeHtml(result.reason || 'The receipt could not be printed.')}</p>`;
@@ -611,7 +587,7 @@ function render() {
   else renderHistory();
 }
 function closeModal() { modalRoot.innerHTML = ''; }
-function openModal(content) { modalRoot.innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true">${content}</section></div>`; modalRoot.querySelector('.modal-backdrop').addEventListener('click', (event) => { if (event.target === event.currentTarget) closeModal(); }); modalRoot.querySelectorAll('[data-close-modal]').forEach((button) => button.addEventListener('click', closeModal)); }
+function openModal(content, extraClass = '') { modalRoot.innerHTML = `<div class="modal-backdrop"><section class="modal${extraClass ? ` ${extraClass}` : ''}" role="dialog" aria-modal="true">${content}</section></div>`; modalRoot.querySelector('.modal-backdrop').addEventListener('click', (event) => { if (event.target === event.currentTarget) closeModal(); }); modalRoot.querySelectorAll('[data-close-modal]').forEach((button) => button.addEventListener('click', closeModal)); }
 function openProductModal(product = null) {
   const title = product ? 'Edit Product' : 'Add New Product'; const categoryOptions = state.categories.map((category) => `<option value="${escapeHtml(category)}" ${product?.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('');
   const selectedUnit = product?.unit || 'piece';

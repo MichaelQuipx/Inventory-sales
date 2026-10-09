@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { createStore, StoreError } = require('./store');
 const { toCsv, toSectionedCsv } = require('./csv');
-const { buildReceiptHtml } = require('./receipt');
+const { buildReceiptHtml, PAPER_WIDTH_MM } = require('./receipt');
 const { looksLikeThermalPrinter, pickPrinter } = require('./printers');
 
 let store;
@@ -149,12 +149,11 @@ async function exportCsv(defaultFileName, csvContent) {
 // Returns the exact same HTML that would be sent to the printer, so the
 // in-app preview is a true WYSIWYG of the printed receipt -- one receipt
 // template, never two implementations to keep in sync.
-function buildReceiptPreview(saleId, paperWidth) {
+function buildReceiptPreview(saleId) {
   if (!saleId || typeof saleId !== 'string') throw new StoreError('A valid sale is required to preview a receipt.');
   const sale = store.getSale(saleId);
   if (!sale) throw new StoreError('That transaction could not be found.');
-  const width = store.RECEIPT_PAPER_WIDTHS.includes(paperWidth) ? paperWidth : store.getSettings().receiptPaperWidth;
-  return buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId), layout: receiptLayout(store.getSettings()) });
+  return buildReceiptHtml(sale, { processedByName: userDisplayName(sale.userId), layout: receiptLayout(store.getSettings()) });
 }
 
 // ---- Receipt printing ----
@@ -166,7 +165,7 @@ function buildReceiptPreview(saleId, paperWidth) {
 // forever. Now we (1) detect installed printers, (2) print silently straight to
 // the chosen one, (3) always time out, and (4) report a real error message.
 // Per-install print preferences any signed-in user may change.
-const HARMLESS_SETTINGS = ['receiptPaperWidth', 'receiptPrinterName', 'receiptTopMarginLines', 'receiptBottomMarginLines', 'receiptLeftMarginChars', 'receiptMinLines'];
+const HARMLESS_SETTINGS = ['receiptPrinterName', 'receiptTopMarginLines', 'receiptBottomMarginLines', 'receiptLeftMarginChars', 'receiptMinLines'];
 function receiptLayout(settings) {
   return { topMarginLines: settings.receiptTopMarginLines, bottomMarginLines: settings.receiptBottomMarginLines, leftMarginChars: settings.receiptLeftMarginChars, minLines: settings.receiptMinLines };
 }
@@ -209,13 +208,12 @@ function sendToPrinter(webContents, options, timeoutMs) {
   });
 }
 
-async function printSaleReceipt(saleId, paperWidth, printerChoice) {
+async function printSaleReceipt(saleId, printerChoice) {
   if (!saleId || typeof saleId !== 'string') throw new StoreError('A valid sale is required to print a receipt.');
   if (printInProgress) throw new StoreError('A receipt is already printing. Please wait for it to finish.');
   const sale = store.getSale(saleId);
   if (!sale) throw new StoreError('That transaction could not be found.');
-  const width = store.RECEIPT_PAPER_WIDTHS.includes(paperWidth) ? paperWidth : store.getSettings().receiptPaperWidth;
-  const widthMm = width === '58mm' ? 58 : 80;
+  const widthMm = PAPER_WIDTH_MM;
 
   const useDialog = printerChoice === PRINT_DIALOG_CHOICE;
   let printerName = null;
@@ -231,7 +229,7 @@ async function printSaleReceipt(saleId, paperWidth, printerChoice) {
   printInProgress = true;
   let printWindow;
   try {
-    const html = buildReceiptHtml(sale, { paperWidth: width, processedByName: userDisplayName(sale.userId), layout: receiptLayout(store.getSettings()) });
+    const html = buildReceiptHtml(sale, { processedByName: userDisplayName(sale.userId), layout: receiptLayout(store.getSettings()) });
     printWindow = new BrowserWindow({
       show: false,
       width: Math.ceil(widthMm * 3.78) + 60,
@@ -254,7 +252,7 @@ async function printSaleReceipt(saleId, paperWidth, printerChoice) {
     let result = await sendToPrinter(printWindow.webContents, { ...baseOptions, pageSize: { width: widthMm * 1000, height: heightMicrons } }, PRINT_TIMEOUT_MS);
     if (!result.success && result.failureType !== 'cancelled') {
       // Some thermal drivers refuse a custom paper size; retry using the
-      // driver's own default paper (the receipt CSS is already 58/80mm wide).
+      // driver's own default paper (the receipt CSS is already 58mm wide).
       result = await sendToPrinter(printWindow.webContents, baseOptions, PRINT_TIMEOUT_MS);
     }
     return {
@@ -300,15 +298,15 @@ function registerStoreHandlers() {
   handle('sale:complete', (items, discount) => { const user = requireAuth(); return store.completeSale(items, user.id, discount); });
   handle('sale:list', (filters) => { requireAuth(); return store.listSales(filters); });
   handle('sale:get', (id) => { requireAuth(); return store.getSale(id); });
-  handle('sale:print-receipt', (saleId, paperWidth, printerChoice) => { requireAuth(); return printSaleReceipt(saleId, paperWidth, printerChoice); });
+  handle('sale:print-receipt', (saleId, printerChoice) => { requireAuth(); return printSaleReceipt(saleId, printerChoice); });
   handle('printers:list', () => { requireAuth(); return getPrinterChoices(); });
-  handle('sale:receipt-preview', (saleId, paperWidth) => { requireAuth(); return buildReceiptPreview(saleId, paperWidth); });
+  handle('sale:receipt-preview', (saleId) => { requireAuth(); return buildReceiptPreview(saleId); });
   handle('sale:void', (saleId, reason) => { const user = requireRole('super-admin'); return store.voidSale(saleId, user.id, reason); });
   handle('archive:summary', () => { requireRole('super-admin'); return store.archiveSummary(); });
   handle('archive:run', (cutoffDate) => { requireRole('super-admin'); return store.archiveSalesBefore(cutoffDate); });
   handle('dashboard:get', (period) => { const user = requireRole('super-admin'); return stripDashboardProfit(store.dashboard(period), user.role); });
   handle('settings:get', () => { requireAuth(); return store.getSettings(); });
-  // receiptPaperWidth / receiptPrinterName are harmless per-install preferences, open to any
+  // receiptPrinterName and the receipt margin settings are harmless per-install preferences, open to any
   // signed-in user. Anything else in settings (e.g. the discount cap) is
   // security-relevant, so it's locked to Super Admin -- otherwise a Regular
   // User could simply raise their own discount ceiling.
